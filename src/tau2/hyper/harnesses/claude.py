@@ -182,6 +182,9 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
         # One entry per Claude Code turn that ended (a `result` frame): the turn
         # loop starts the next one until submit, the budget or the allowance.
         self._turn_ends: list[dict] = []
+        # One per Claude Code process the loop started (an `init` frame): the
+        # last turn usually ends with the host's kill on submit and has no end.
+        self._turns_started = 0
 
     def harness_config_metadata(self) -> dict:
         metadata = {
@@ -212,9 +215,13 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
 
     def reset_build_state(self) -> None:
         self._turn_ends = []
+        self._turns_started = 0
 
     def build_turns(self) -> list[dict] | None:
         return list(self._turn_ends)
+
+    def turns_started(self) -> int | None:
+        return self._turns_started
 
     def skills_read(self, steps) -> list[str] | None:
         """The run's skills the Developer loaded with the Skill tool, in order of first load."""
@@ -456,6 +463,9 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
             return []
 
         frame_type = frame.get("type")
+        if frame_type == "system" and frame.get("subtype") == "init":
+            self._turns_started += 1
+            return []
         if frame_type == "assistant":
             return self._assistant_steps(frame)
         if frame_type == "user":

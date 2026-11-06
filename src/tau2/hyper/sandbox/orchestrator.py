@@ -101,7 +101,10 @@ def _build_end_record(build_result: BuildResult) -> dict:
         }
     turns = meta.get("turns")
     if isinstance(turns, list):
-        record["turns"] = len(turns)
+        # The turns started, when counted: the last one usually has no end (the
+        # host kills the process on submit), so the ends alone undercount.
+        started = meta.get("turns_started")
+        record["turns"] = max(len(turns), started if isinstance(started, int) else 0)
         record["turn_ends"] = turns
     skills_read = meta.get("skills_read")
     if isinstance(skills_read, list):

@@ -319,6 +319,7 @@ def test_claude_counts_turns_and_the_skills_the_developer_read(tmp_path):
     builder.reset_build_state()
 
     steps = []
+    assert builder.normalize_event(_stdout(0.5, {"type": "system", "subtype": "init", "session_id": "s1"})) == []
     steps += builder.normalize_event(
         _stdout(
             3.0,
@@ -334,6 +335,7 @@ def test_claude_counts_turns_and_the_skills_the_developer_read(tmp_path):
     )
     # A turn that ended with no submit: the loop continues it, and a second turn ends later.
     assert builder.normalize_event(_stdout(126.4, {"type": "result", "subtype": "success", "is_error": False, "num_turns": 28})) == []
+    assert builder.normalize_event(_stdout(127.0, {"type": "system", "subtype": "init", "session_id": "s1"})) == []
     steps += builder.normalize_event(
         _stdout(
             300.0,
@@ -349,7 +351,10 @@ def test_claude_counts_turns_and_the_skills_the_developer_read(tmp_path):
         )
     )
     builder.normalize_event(_stdout(900.0, {"type": "result", "subtype": "success", "is_error": False, "num_turns": 61, "result": "Submitted."}))
+    # A third turn started and was killed by the host on submit: it has no end.
+    assert builder.normalize_event(_stdout(901.0, {"type": "system", "subtype": "init", "session_id": "s1"})) == []
 
+    assert builder.turns_started() == 3
     assert builder.build_turns() == [
         {"ended_at": 126.4, "subtype": "success", "is_error": False, "num_turns": 28},
         {"ended_at": 900.0, "subtype": "success", "is_error": False, "num_turns": 61},
@@ -369,12 +374,13 @@ def test_claude_counts_turns_and_the_skills_the_developer_read(tmp_path):
         metadata={
             "process": {"exit_code": 0, "timed_out": False, "cancelled": True, "event_count": 9, "stderr_tail": "x" * 5000},
             "turns": builder.build_turns(),
+            "turns_started": builder.turns_started(),
             "skills_read": builder.skills_read(steps),
         },
     )
     record = _build_end_record(result)
     assert record["process"] == {"exit_code": 0, "timed_out": False, "cancelled": True, "stderr_tail": "x" * 1000}
-    assert record["turns"] == 2
+    assert record["turns"] == 3, "the turns started: the third ended with the kill on submit"
     assert record["turn_ends"][0]["ended_at"] == 126.4
     assert record["skills_read"] == ["build-the-agent"]
     # A harness that records none of it leaves the keys out.

@@ -156,6 +156,10 @@ class NativeSandboxBuilder(ABC):
         """The harness's turns that ended during the build (a turn loop's record); None when it does not count them."""
         return None
 
+    def turns_started(self) -> Optional[int]:
+        """How many turns the harness started (the last one usually ends with the host's kill on submit); None when it does not count them."""
+        return None
+
     def skills_read(self, steps: list[BuildStep]) -> Optional[list[str]]:
         """The run's skills the Developer loaded, by name; None for a harness with no skills."""
         return None
@@ -350,6 +354,9 @@ class NativeSandboxBuilder(ABC):
                 turns = self.build_turns()
                 if turns is not None:
                     result.metadata["turns"] = turns
+                turns_begun = self.turns_started()
+                if turns_begun is not None:
+                    result.metadata["turns_started"] = turns_begun
                 skills_read = self.skills_read(result.steps)
                 if skills_read is not None:
                     result.metadata["skills_read"] = skills_read
