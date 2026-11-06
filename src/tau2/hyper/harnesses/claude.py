@@ -17,8 +17,9 @@ CLAUDE_CODE_HARNESS_VERSION = "2.1.219"
 # Skills a run hands the Developer ride as one plugin below the private runtime
 # home (never the kit): ``--plugin-dir`` loads it for the session, and the
 # harness's skills switch stays on for that run only. A CLAUDE.md beside it, the
-# user-level file Claude Code puts in every session's system prompt, tells the
-# Developer to load each skill with the Skill tool before it reads the kit: a
+# user-level file Claude Code puts in every session's context (a `# claudeMd`
+# system reminder in the first user message, carried by every later call), tells
+# the Developer to load each skill with the Skill tool before it reads the kit: a
 # skill that is only described is never read (the first runs showed it), and a
 # skill that is never read measures nothing.
 SKILLS_PLUGIN_NAME = "strata-skills"
