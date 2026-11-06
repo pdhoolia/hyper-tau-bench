@@ -80,6 +80,35 @@ from tau2.runner.build import load_tasks_from_file
 _KIT_BASELINE_MESSAGE = "Initial import"
 
 
+def _build_end_record(build_result: BuildResult) -> dict:
+    """The end of the harness process, the turn loop's turns and the skills read, from the build's metadata.
+
+    ``process`` is how the harness process ended (its exit code, whether the wall
+    clock or a cancel ended it, the tail of its stderr); ``turns`` the turns a
+    turn loop ran (each with when it ended and the harness's own verdict on it)
+    and their count; ``skills_read`` the run's skills the Developer loaded, when
+    the run had skills. A harness that records none of these leaves them out.
+    """
+    record: dict = {}
+    meta = build_result.metadata or {}
+    process = meta.get("process")
+    if isinstance(process, dict):
+        record["process"] = {
+            "exit_code": process.get("exit_code"),
+            "timed_out": bool(process.get("timed_out", False)),
+            "cancelled": bool(process.get("cancelled", False)),
+            "stderr_tail": str(process.get("stderr_tail") or "")[-1000:],
+        }
+    turns = meta.get("turns")
+    if isinstance(turns, list):
+        record["turns"] = len(turns)
+        record["turn_ends"] = turns
+    skills_read = meta.get("skills_read")
+    if isinstance(skills_read, list):
+        record["skills_read"] = list(skills_read)
+    return record
+
+
 def _get_git_sha() -> Optional[str]:
     """Return the current repository commit SHA when available."""
     repo_root = Path(__file__).resolve().parents[4]
@@ -938,6 +967,11 @@ class SandboxOrchestrator:
                 "total_steps": build_result.total_steps,
                 "total_tool_calls": build_result.total_tool_calls,
                 "client_turns_used": build_result.client_turns_used,
+                # How the harness process ended, the turns a turn loop ran, and
+                # the run's skills the Developer loaded: what a reader needs to
+                # tell a build that stopped early from one that used its budget,
+                # and a skills arm that read its skill from one that did not.
+                **_build_end_record(build_result),
             },
             "performance": performance_details,
             "live_experiment": {
