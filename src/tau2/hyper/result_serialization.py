@@ -88,6 +88,9 @@ def compact_run_result(
                 "reward": d.get("reward"),
                 "error": d.get("error"),
                 "agent_credit_usage": d.get("agent_credit_usage"),
+                # The conversation the test's model calls were made under (a provider base_url's
+                # {conversation}); None when unscoped.
+                "conversation_id": d.get("conversation_id"),
             }
             for d in (result.test_details or [])
         ],
