@@ -22,7 +22,8 @@ def create_developer_builder(
     """Build the selected coding-agent integration for a construction run.
 
     ``developer_skills_dir`` names a directory of skills (one ``SKILL.md`` per
-    child directory) the harness loads for the run; Claude Code and Bob take one.
+    child directory, with the text files beside it) the harness loads for the
+    run; Claude Code and Bob take one.
     ``developer_artifacts_dir`` is where what the harness kept below its private
     runtime home is copied after the build (Bob's task store and its spans);
     a harness that keeps nothing copies nothing.

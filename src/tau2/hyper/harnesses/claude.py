@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,14 @@ SKILLS_DIRECTIVE_PATH = "/runtime-home/.claude/CLAUDE.md"
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _DESCRIPTION_RE = re.compile(r"^description:\s*(.+?)\s*$", re.MULTILINE)
+# A skill's other files (scripts/, references/, …) ride beside its SKILL.md at
+# the same relative paths. Text only (UTF-8, no NUL byte), each file at most
+# SKILL_FILE_MAX_BYTES and a skill's files together at most
+# SKILL_FILES_MAX_BYTES; hidden entries and __pycache__ are left out, and a
+# symbolic link is refused. A file that breaks a rule stops the run before it
+# starts: a skill that names a file the sandbox does not have measures nothing.
+SKILL_FILE_MAX_BYTES = 256 * 1024
+SKILL_FILES_MAX_BYTES = 1024 * 1024
 
 
 def _skill_description(content: str) -> str:
@@ -47,17 +56,56 @@ def _skill_description(content: str) -> str:
     return text
 
 
-def load_skills_dir(skills_dir: str | Path) -> list[dict[str, str]]:
-    """Read ``<dir>/<name>/SKILL.md`` files: ``[{"name", "content", "description"}]``, by name.
+def _skill_files(skill_dir: Path) -> dict[str, str]:
+    """A skill's files other than SKILL.md, by POSIX path relative to its directory."""
+    files: dict[str, str] = {}
+    total = 0
+    for current, dirs, names in os.walk(skill_dir, followlinks=False):
+        here = Path(current)
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__")
+        for name in dirs:
+            if (here / name).is_symlink():
+                raise ValueError(f"A symbolic link is not carried: {here / name}")
+        for name in sorted(names):
+            path = here / name
+            relative = path.relative_to(skill_dir).as_posix()
+            if name.startswith(".") or relative == "SKILL.md":
+                continue
+            if path.is_symlink():
+                raise ValueError(f"A symbolic link is not carried: {path}")
+            data = path.read_bytes()
+            if len(data) > SKILL_FILE_MAX_BYTES:
+                raise ValueError(
+                    f"A skill file is over {SKILL_FILE_MAX_BYTES} bytes: {path}"
+                )
+            if b"\0" in data:
+                raise ValueError(f"A skill file must be text: {path}")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"A skill file must be UTF-8 text: {path}") from exc
+            total += len(data)
+            if total > SKILL_FILES_MAX_BYTES:
+                raise ValueError(
+                    f"A skill's files are over {SKILL_FILES_MAX_BYTES} bytes together: {skill_dir}"
+                )
+            files[relative] = text
+    return files
 
-    The directory name is the skill's name (a kebab-case slug); a child with no
+
+def load_skills_dir(skills_dir: str | Path) -> list[dict[str, Any]]:
+    """Read ``<dir>/<name>/SKILL.md`` and the files beside it, by name.
+
+    Each skill is ``{"name", "content", "description", "files"}``, ``files``
+    the skill's other text files by relative path (``scripts/audit.py``). The
+    directory name is the skill's name (a kebab-case slug); a child with no
     SKILL.md is skipped. An empty directory is an error: a skills arm with no
     skills is a misconfiguration, not the baseline.
     """
     root = Path(skills_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Skills directory not found: {root}")
-    skills: list[dict[str, str]] = []
+    skills: list[dict[str, Any]] = []
     for child in sorted(root.iterdir()):
         skill_md = child / "SKILL.md"
         if not child.is_dir() or not skill_md.is_file():
@@ -72,6 +120,7 @@ def load_skills_dir(skills_dir: str | Path) -> list[dict[str, str]]:
                 "name": child.name,
                 "content": content,
                 "description": _skill_description(content),
+                "files": _skill_files(child),
             }
         )
     if not skills:
@@ -79,7 +128,16 @@ def load_skills_dir(skills_dir: str | Path) -> list[dict[str, str]]:
     return skills
 
 
-def render_skills_directive(skills: list[dict[str, str]]) -> str:
+def skill_files_metadata(skills: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """The files each skill carries beside its SKILL.md, for the run's record; only skills with some."""
+    return {
+        skill["name"]: sorted(skill["files"])
+        for skill in skills
+        if skill.get("files")
+    }
+
+
+def render_skills_directive(skills: list[dict[str, Any]]) -> str:
     """The CLAUDE.md that tells the Developer to load the run's skills first."""
     count = "One skill was" if len(skills) == 1 else f"{len(skills)} skills were"
     lines = [
@@ -211,6 +269,9 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
             metadata["skills"] = [skill["name"] for skill in self.skills]
             metadata["skills_plugin"] = SKILLS_PLUGIN_NAME
             metadata["skills_directive"] = "claude-md"
+            skill_files = skill_files_metadata(self.skills)
+            if skill_files:
+                metadata["skill_files"] = skill_files
         return metadata
 
     def reset_build_state(self) -> None:
@@ -367,7 +428,7 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
         return files
 
     def skills_plugin_files(self) -> dict[str, str]:
-        """The plugin that carries the run's skills (a manifest and one SKILL.md each), and the CLAUDE.md that says to load them."""
+        """The plugin that carries the run's skills (a manifest, each SKILL.md and the files beside it), and the CLAUDE.md that says to load them."""
         if not self.skills:
             return {}
         files = {
@@ -383,9 +444,10 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
             )
         }
         for skill in self.skills:
-            files[f"{SKILLS_PLUGIN_PATH}/skills/{skill['name']}/SKILL.md"] = skill[
-                "content"
-            ]
+            base = f"{SKILLS_PLUGIN_PATH}/skills/{skill['name']}"
+            files[f"{base}/SKILL.md"] = skill["content"]
+            for relative, text in skill.get("files", {}).items():
+                files[f"{base}/{relative}"] = text
         return files
 
     def harness_command(self) -> list[str]:
