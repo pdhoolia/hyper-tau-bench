@@ -41,7 +41,8 @@ end are in the store instead of being cut by the host's kill.
 
 Skills reach Bob the way they reach Claude Code, below the private runtime
 home and never in the kit: each ``<name>/SKILL.md`` of the run's skills
-directory is written to ``/runtime-home/.bob/skills/<name>/SKILL.md``, Bob's
+directory is written to ``/runtime-home/.bob/skills/<name>/SKILL.md`` (and
+the skill's other text files beside it, at their relative paths), Bob's
 global skills location (Shell 2.0.9 reads ``~/.bob/skills``, lists each skill's
 name and description in its system prompt under ``available_skills`` and loads
 one with its ``use_skill`` tool when the request matches the description), and
@@ -62,7 +63,7 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-from tau2.hyper.harnesses.claude import load_skills_dir
+from tau2.hyper.harnesses.claude import load_skills_dir, skill_files_metadata
 from tau2.hyper.sandbox.builder import BuildStep
 from tau2.hyper.sandbox.model_gateway import ModelGatewaySpec
 from tau2.hyper.sandbox.native_builder import NativeSandboxBuilder
@@ -95,7 +96,7 @@ BOB_SKILLS_DIR = "/runtime-home/.bob/skills"
 BOB_SKILLS_DIRECTIVE_PATH = "/runtime-home/.bob/rules/strata-skills.md"
 
 
-def render_bob_skills_directive(skills: list[dict[str, str]]) -> str:
+def render_bob_skills_directive(skills: list[dict[str, Any]]) -> str:
     """The global rule that tells Bob to activate the run's skills first."""
     count = "One skill was" if len(skills) == 1 else f"{len(skills)} skills were"
     lines = [
@@ -155,6 +156,9 @@ class BobShellSandboxBuilder(NativeSandboxBuilder):
             metadata["skills"] = [skill["name"] for skill in self.skills]
             metadata["skills_location"] = BOB_SKILLS_DIR
             metadata["skills_directive"] = "global-rule"
+            skill_files = skill_files_metadata(self.skills)
+            if skill_files:
+                metadata["skill_files"] = skill_files
         return metadata
 
     @property
@@ -258,12 +262,15 @@ class BobShellSandboxBuilder(NativeSandboxBuilder):
         return files
 
     def skills_files(self) -> dict[str, str]:
-        """The run's skills below Bob's global skills directory, and the rule that says to activate them."""
+        """The run's skills (each SKILL.md and the files beside it) below Bob's global skills directory, and the rule that says to activate them."""
         if not self.skills:
             return {}
         files = {BOB_SKILLS_DIRECTIVE_PATH: render_bob_skills_directive(self.skills)}
         for skill in self.skills:
-            files[f"{BOB_SKILLS_DIR}/{skill['name']}/SKILL.md"] = skill["content"]
+            base = f"{BOB_SKILLS_DIR}/{skill['name']}"
+            files[f"{base}/SKILL.md"] = skill["content"]
+            for relative, text in skill.get("files", {}).items():
+                files[f"{base}/{relative}"] = text
         return files
 
     def skills_read(self, steps) -> list[str] | None:

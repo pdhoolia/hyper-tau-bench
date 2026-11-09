@@ -1162,9 +1162,10 @@ def main():
         type=str,
         default=None,
         help=(
-            "A directory of skills (<name>/SKILL.md per child) the Developer "
-            "harness loads for this run, as a session plugin below its private "
-            "runtime home; the kit is untouched. Claude Code only."
+            "A directory of skills (<name>/SKILL.md per child, with any text "
+            "files beside it, such as scripts/ and references/) the Developer "
+            "harness loads for this run, below its private runtime home; the "
+            "kit is untouched. Claude Code and Bob."
         ),
     )
     hyper_tau_parser.add_argument(

@@ -385,3 +385,85 @@ def test_claude_counts_turns_and_the_skills_the_developer_read(tmp_path):
     assert record["skills_read"] == ["build-the-agent"]
     # A harness that records none of it leaves the keys out.
     assert _build_end_record(BuildResult(kit_path=tmp_path)) == {}
+
+
+def _skill_with_files(tmp_path):
+    skills = tmp_path / "skills"
+    base = skills / "construction-procedure"
+    (base / "scripts").mkdir(parents=True)
+    (base / "references").mkdir()
+    (base / "SKILL.md").write_text("---\nname: construction-procedure\n---\nrun scripts/audit.py\n")
+    (base / "scripts" / "audit.py").write_text("print('audit')\n")
+    (base / "references" / "policy.md").write_text("# Policy\n")
+    (base / ".DS_Store").write_bytes(b"\x00\x01")
+    (base / "scripts" / "__pycache__").mkdir()
+    (base / "scripts" / "__pycache__" / "audit.cpython-312.pyc").write_bytes(b"\x00pyc")
+    return skills
+
+
+def test_claude_carries_a_skills_other_files_beside_its_skill_md(tmp_path):
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=_skill_with_files(tmp_path))
+    files = builder.runtime_files(include_client_tool=False)
+    base = "/runtime-home/plugins/strata-skills/skills/construction-procedure"
+
+    assert files[f"{base}/SKILL.md"].endswith("run scripts/audit.py\n")
+    assert files[f"{base}/scripts/audit.py"] == "print('audit')\n"
+    assert files[f"{base}/references/policy.md"] == "# Policy\n"
+    # Hidden entries and bytecode stay behind; nothing else of the skill rides.
+    assert sorted(p for p in files if p.startswith(base)) == [
+        f"{base}/SKILL.md",
+        f"{base}/references/policy.md",
+        f"{base}/scripts/audit.py",
+    ]
+    assert builder.harness_identity().config["skill_files"] == {
+        "construction-procedure": ["references/policy.md", "scripts/audit.py"]
+    }
+
+
+def test_a_skill_with_only_skill_md_records_no_files(tmp_path):
+    skills = tmp_path / "skills"
+    (skills / "build-the-agent").mkdir(parents=True)
+    (skills / "build-the-agent" / "SKILL.md").write_text("---\nname: build-the-agent\n---\nbody\n")
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+
+    assert builder.skills[0]["files"] == {}
+    assert "skill_files" not in builder.harness_identity().config
+
+
+def test_a_skill_file_that_is_binary_too_large_or_a_link_is_refused(tmp_path):
+    import pytest
+
+    from tau2.hyper.harnesses.claude import SKILL_FILE_MAX_BYTES, load_skills_dir
+
+    def fresh(name):
+        skills = tmp_path / name
+        (skills / "s").mkdir(parents=True)
+        (skills / "s" / "SKILL.md").write_text("---\nname: s\n---\nbody\n")
+        return skills
+
+    binary = fresh("binary")
+    (binary / "s" / "logo.png").write_bytes(b"\x89PNG\x00\x00")
+    with pytest.raises(ValueError, match="must be text"):
+        load_skills_dir(binary)
+
+    latin = fresh("latin")
+    (latin / "s" / "notes.md").write_bytes("caf\xe9".encode("latin-1"))
+    with pytest.raises(ValueError, match="UTF-8"):
+        load_skills_dir(latin)
+
+    large = fresh("large")
+    (large / "s" / "big.md").write_text("x" * (SKILL_FILE_MAX_BYTES + 1))
+    with pytest.raises(ValueError, match="over"):
+        load_skills_dir(large)
+
+    together = fresh("together")
+    for index in range(5):
+        (together / "s" / f"part{index}.md").write_text("x" * SKILL_FILE_MAX_BYTES)
+    with pytest.raises(ValueError, match="together"):
+        load_skills_dir(together)
+
+    linked = fresh("linked")
+    (tmp_path / "outside.md").write_text("outside\n")
+    (linked / "s" / "outside.md").symlink_to(tmp_path / "outside.md")
+    with pytest.raises(ValueError, match="symbolic link"):
+        load_skills_dir(linked)

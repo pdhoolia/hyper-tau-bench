@@ -473,3 +473,20 @@ def test_the_factory_hands_bob_a_skills_dir_and_still_refuses_one_for_opencode(
         create_developer_builder(
             "opencode", "gpt-5.4", None, None, developer_skills_dir=skills
         )
+
+
+def test_bob_carries_a_skills_other_files_beside_its_skill_md(tmp_path):
+    skills = tmp_path / "skills"
+    base = skills / "construction-procedure"
+    (base / "scripts").mkdir(parents=True)
+    (base / "SKILL.md").write_text("---\nname: construction-procedure\n---\nbody\n")
+    (base / "scripts" / "preflight.py").write_text("print('preflight')\n")
+    builder = BobShellSandboxBuilder("bob-default", skills_dir=skills)
+
+    files = builder.runtime_files(include_client_tool=False)
+    assert files[f"{BOB_SKILLS_DIR}/construction-procedure/scripts/preflight.py"] == (
+        "print('preflight')\n"
+    )
+    assert builder.harness_identity().config["skill_files"] == {
+        "construction-procedure": ["scripts/preflight.py"]
+    }
