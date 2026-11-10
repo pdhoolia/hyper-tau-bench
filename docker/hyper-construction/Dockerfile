@@ -134,6 +134,14 @@ RUN printf '%s\n' \
 
 WORKDIR /workspace
 
+# A cluster may run the container as a user id of its own choosing, in group 0
+# (OpenShift's restricted rules). The folders a build writes are volumes there;
+# these are their mount points and the data folder, writable by that group, so
+# the image runs the same with or without a volume on them, under any user id.
+RUN mkdir -p /runtime-home /run/tau2-callback \
+    && chgrp -R 0 /workspace /runtime-home /run/tau2-callback /opt/tau2/data \
+    && chmod -R g=u /workspace /runtime-home /run/tau2-callback /opt/tau2/data
+
 RUN codex --version \
     && claude --version \
     && opencode --version \

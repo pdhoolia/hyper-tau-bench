@@ -613,6 +613,13 @@ class NativeSandboxRuntime:
             self.close(force=True)
             raise
 
+    def _exec_probe(self, command: list[str], *, timeout: int = 15):
+        """Run a short command in the sandbox and return its completed process."""
+        return self._docker_command(
+            ["docker", "exec", self.container_name, *command],
+            timeout=timeout,
+        )
+
     def _verify_runtime_contract(self) -> None:
         """Fail before model startup when host and image APIs disagree."""
         probe = (
@@ -622,10 +629,7 @@ class NativeSandboxRuntime:
             "print(json.dumps({'contract_version': version, "
             "'source_revision': os.environ.get('TAU2_SOURCE_REVISION', 'unknown')}))"
         )
-        result = self._docker_command(
-            ["docker", "exec", self.container_name, "python", "-c", probe],
-            timeout=15,
-        )
+        result = self._exec_probe(["python", "-c", probe], timeout=15)
         expected = self.config.required_contract_version
         try:
             metadata = json.loads(result.stdout.strip())

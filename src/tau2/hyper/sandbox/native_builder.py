@@ -24,6 +24,11 @@ from tau2.hyper.sandbox.builder import (
     ModelIdentity,
 )
 from tau2.hyper.sandbox.callback_broker import CallbackBroker
+from tau2.hyper.sandbox.kube_runtime import (
+    KUBE_BACKEND,
+    KubeSandboxRuntime,
+    sandbox_backend,
+)
 from tau2.hyper.sandbox.model_gateway import ModelGatewaySpec
 from tau2.hyper.sandbox.native_runtime import (
     NativeMount,
@@ -316,7 +321,13 @@ class NativeSandboxBuilder(ABC):
                     lifetime_seconds=budget.max_time_seconds + 60,
                 )
                 runtime_image = self.docker_image or DEFAULT_CONSTRUCTION_RUNTIME_IMAGE
-                runtime = NativeSandboxRuntime(
+                # Docker by default; pods when TAU2_SANDBOX_BACKEND=kubernetes.
+                runtime_class = (
+                    KubeSandboxRuntime
+                    if sandbox_backend() == KUBE_BACKEND
+                    else NativeSandboxRuntime
+                )
+                runtime = runtime_class(
                     kit_path,
                     config=NativeRuntimeConfig(
                         image=runtime_image,
