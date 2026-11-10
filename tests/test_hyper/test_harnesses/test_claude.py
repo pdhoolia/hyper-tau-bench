@@ -467,3 +467,50 @@ def test_a_skill_file_that_is_binary_too_large_or_a_link_is_refused(tmp_path):
     (linked / "s" / "outside.md").symlink_to(tmp_path / "outside.md")
     with pytest.raises(ValueError, match="symbolic link"):
         load_skills_dir(linked)
+
+
+def test_a_skills_submit_gate_is_the_one_hook_on_the_submit_tool(tmp_path):
+    skills = tmp_path / "skills"
+    (skills / "procedure").mkdir(parents=True)
+    (skills / "procedure" / "SKILL.md").write_text(
+        "---\nname: procedure\ndescription: steps\n"
+        "submit-gate: python3 scripts/before_submit.py /workspace --hook\n---\nbody\n"
+    )
+    (skills / "plain").mkdir()
+    (skills / "plain" / "SKILL.md").write_text("---\nname: plain\n---\nbody\n")
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+    settings = json.loads(builder.runtime_files(include_client_tool=False)[builder.runtime_config_path])
+
+    assert settings["disableAllHooks"] is False
+    assert settings["hooks"] == {
+        "PreToolUse": [
+            {
+                "matcher": "mcp__hyper_tau__submit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "cd /runtime-home/plugins/strata-skills/skills/procedure"
+                        " && python3 scripts/before_submit.py /workspace --hook",
+                        "timeout": 60,
+                    }
+                ],
+            }
+        ]
+    }
+    assert builder.harness_identity().config["submit_gates"] == {
+        "procedure": "python3 scripts/before_submit.py /workspace --hook"
+    }
+
+
+def test_skills_without_a_submit_gate_keep_every_hook_off(tmp_path):
+    skills = tmp_path / "skills"
+    (skills / "plain").mkdir(parents=True)
+    (skills / "plain" / "SKILL.md").write_text("---\nname: plain\n---\nsubmit-gate: in the body is not a gate\n")
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+    settings = json.loads(builder.runtime_files(include_client_tool=False)[builder.runtime_config_path])
+
+    assert settings["disableAllHooks"] is True
+    assert "hooks" not in settings
+    assert "submit_gates" not in builder.harness_identity().config
+    bare = json.loads(ClaudeCodeSandboxBuilder("claude-sonnet-4-5").render_runtime_config(include_client_tool=False))
+    assert bare["disableAllHooks"] is True and "hooks" not in bare

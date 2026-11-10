@@ -465,3 +465,23 @@ class TestClientSimulatorWithTaskInstructions:
         )
         state = client.get_init_state()
         assert state.system_messages[0].content == instructions
+
+
+def test_a_task_runs_on_another_tasks_performance_profile():
+    import pytest
+
+    from tau2.hyper.task_loader import load_hyper_tau_task, with_performance_profile_from
+
+    easy = load_hyper_tau_task("007_retail_plus_construction_core_evidence_seeded_all_defects_performance_easy")
+    medium = load_hyper_tau_task("010_retail_plus_construction_core_evidence_hard_client_all_defects_performance_medium")
+    lent = with_performance_profile_from(easy, medium.id)
+
+    assert lent.id == easy.id
+    assert lent.performance_profile == medium.performance_profile
+    assert lent.allowed_agent_models == medium.allowed_agent_models
+    assert [r.budget for r in lent.performance_requirements] == [0.082]
+    # Everything but the tier is the task's own: the seeded workspace, the held-out set.
+    assert lent.starting_workspace_path == easy.starting_workspace_path
+    assert lent.test_task_ids == easy.test_task_ids
+    with pytest.raises(ValueError, match="telecom"):
+        with_performance_profile_from(easy, "013_telecom_construction_core_evidence_seeded_all_defects_performance_medium")
