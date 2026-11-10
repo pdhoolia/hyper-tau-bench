@@ -132,9 +132,11 @@ def test_sandbox_pod_is_restricted_and_resolves_only_the_gateway():
     mounts = {item["mountPath"] for item in container["volumeMounts"]}
     assert mounts == {"/workspace", "/runtime-home", "/run/tau2-callback"}
     assert all("emptyDir" in volume for volume in spec["volumes"])
+    # Docker's ceilings are limits here, never requests: eight pods that each
+    # reserved 2 CPUs would not fit on a node that runs them side by side.
     assert container["resources"] == {
         "limits": {"memory": "4Gi", "cpu": "2"},
-        "requests": {"memory": "4Gi", "cpu": "2"},
+        "requests": {"cpu": "250m", "memory": "768Mi"},
     }
 
 
@@ -153,6 +155,7 @@ def test_gateway_pod_takes_its_keys_from_a_secret_only():
     ]
     assert "env" not in container
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
+    assert container["resources"] == {"requests": {"cpu": "50m", "memory": "64Mi"}}
     # The gateway keeps the cluster's name service: it has to find its upstream.
     assert "dnsPolicy" not in manifest["spec"]
     service = gateway_service_manifest(
@@ -198,7 +201,14 @@ def test_scoring_pod_has_no_network_and_a_read_only_root():
     container = manifest["spec"]["containers"][0]
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
     assert container["env"] == [{"name": "HOME", "value": "/tmp"}]
-    assert "resources" not in container
+    assert container["resources"] == {"requests": {"cpu": "100m", "memory": "256Mi"}}
+    capped = scoring_pod_manifest(
+        name="tau2-candidate-abc", image=IMAGE, memory="4g", cpus="2"
+    )["spec"]["containers"][0]["resources"]
+    assert capped == {
+        "requests": {"cpu": "100m", "memory": "256Mi"},
+        "limits": {"memory": "4Gi", "cpu": "2"},
+    }
 
 
 @pytest.mark.parametrize(

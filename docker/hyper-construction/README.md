@@ -127,7 +127,14 @@ oc delete pod,service,secret,networkpolicy -l tau2.hyper/build
 oc delete pod -l tau2.hyper/role=scoring
 ```
 
+A task's `docker_memory` and `docker_cpus` are ceilings under Docker, so here
+they are the pod's limits and never its requests: eight scoring pods that each
+reserved 2 CPUs would wait for a node that runs them side by side. Each kind
+of pod requests what one was measured to use (`REQUESTS` in `kube_runtime.py`:
+the sandbox 250m and 768Mi, a scoring pod 100m and 256Mi, the model gateway
+50m and 64Mi).
+
 Only a Claude Code build has been run on this path. Not there yet: the other
-harnesses, a user id for a cluster that assigns none, requests and limits by
-default, a build stopped from outside, and a kit copy that sends only what
+harnesses, a user id for a cluster that assigns none, limits for a task that
+names none, a build stopped from outside, and a kit copy that sends only what
 changed.

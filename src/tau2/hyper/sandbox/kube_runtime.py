@@ -283,13 +283,30 @@ def _memory_quantity(value: Optional[str]) -> Optional[str]:
     return text
 
 
-def _resources(memory: Optional[str], cpus: Optional[str]) -> dict:
+# What a pod asks the scheduler for. Docker's `--memory` and `--cpus` are ceilings:
+# eight scoring containers capped at 2 CPUs each run side by side on a laptop. As
+# requests they would each reserve that much, and a node (or a project's quota)
+# takes two of them. So the task's Docker settings become limits only, and the
+# request is what a pod of that kind was measured to use (one build of a retail
+# task on OpenShift Local, 2026-11-11), never more than its limit.
+REQUESTS = {
+    ROLE_SANDBOX: {"cpu": "250m", "memory": "768Mi"},
+    ROLE_GATEWAY: {"cpu": "50m", "memory": "64Mi"},
+    ROLE_SCORING: {"cpu": "100m", "memory": "256Mi"},
+}
+
+
+def _resources(role: str, memory: Optional[str] = None, cpus: Optional[str] = None) -> dict:
+    """Requests by the pod's kind; limits from the task's Docker settings, when it has any."""
+    resources: dict[str, Any] = {"requests": dict(REQUESTS[role])}
     limits = {}
     if memory:
         limits["memory"] = _memory_quantity(memory)
     if cpus:
         limits["cpu"] = str(cpus)
-    return {"limits": limits, "requests": dict(limits)} if limits else {}
+    if limits:
+        resources["limits"] = limits
+    return resources
 
 
 def _container_security(*, read_only_root: bool) -> dict:
@@ -373,9 +390,7 @@ def sandbox_pod_manifest(
         "securityContext": _container_security(read_only_root=False),
         "volumeMounts": mounts,
     }
-    resources = _resources(memory, cpus)
-    if resources:
-        container["resources"] = resources
+    container["resources"] = _resources(ROLE_SANDBOX, memory, cpus)
     return _pod_base(
         name,
         {LABEL_BUILD: name, LABEL_ROLE: ROLE_SANDBOX},
@@ -409,6 +424,7 @@ def gateway_pod_manifest(
                     "command": ["python", "-m", "tau2.hyper.sandbox.model_gateway"],
                     "envFrom": [{"secretRef": {"name": secret_name}}],
                     "ports": [{"containerPort": MODEL_GATEWAY_PORT}],
+                    "resources": _resources(ROLE_GATEWAY),
                     "securityContext": _container_security(read_only_root=True),
                     "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
                 }
@@ -502,9 +518,7 @@ def scoring_pod_manifest(
             {"name": "tmp", "mountPath": "/tmp"},
         ],
     }
-    resources = _resources(memory, cpus)
-    if resources:
-        container["resources"] = resources
+    container["resources"] = _resources(ROLE_SCORING, memory, cpus)
     return _pod_base(
         name,
         {LABEL_ROLE: ROLE_SCORING},
