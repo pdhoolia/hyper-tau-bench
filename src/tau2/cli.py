@@ -980,6 +980,17 @@ def main():
         ),
     )
     hyper_tau_parser.add_argument(
+        "--performance-profile-from",
+        type=str,
+        default=None,
+        metavar="TASK_ID",
+        help=(
+            "Run the task under another task's performance profile (its model "
+            "menu and credit budget; same domain), everything else unchanged: "
+            "007 on 010's medium tier, say."
+        ),
+    )
+    hyper_tau_parser.add_argument(
         "--user-llm",
         type=str,
         default=None,
@@ -1578,6 +1589,19 @@ def run_hyper_tau(args):
     except (FileNotFoundError, LegacyHyperTauDomainError) as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
+
+    if getattr(args, "performance_profile_from", None):
+        from tau2.hyper.task_loader import with_performance_profile_from
+
+        try:
+            task = with_performance_profile_from(task, args.performance_profile_from)
+        except (FileNotFoundError, ValueError) as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+        console.print(
+            f"Performance profile from {args.performance_profile_from}: "
+            f"{json.dumps(task.performance_profile, default=str)[:200]}"
+        )
 
     # Handle transformation audits without starting an outer-loop run.
     if args.compile_report:

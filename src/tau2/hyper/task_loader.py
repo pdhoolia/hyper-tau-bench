@@ -86,6 +86,38 @@ def load_hyper_tau_task(task_id: str) -> HyperTauTask:
     )
 
 
+def _raw_task_data(task_id: str) -> dict:
+    """The JSON object of the task file whose ``id`` is *task_id*."""
+    for task_file in sorted(HYPER_TAU_TASKS_DIR.glob("*.json")):
+        with open(task_file) as f:
+            data = json.load(f)
+        if data.get("id") == task_id:
+            return data
+    raise FileNotFoundError(f"Hyper-τ task '{task_id}' not found")
+
+
+def with_performance_profile_from(task: HyperTauTask, donor_id: str) -> HyperTauTask:
+    """*task* with the ``performance_profile`` of task *donor_id*, everything else as it is.
+
+    The kit, the seeded workspace, the Client and the held-out conversations stay
+    *task*'s; the built agent's model menu and credit budget become the donor's, so
+    one task is measured on another tier of the same domain without a task file of
+    its own (the release set stays as it is). Both tasks must share a domain.
+    """
+    donor = load_hyper_tau_task(donor_id)
+    if donor.source_domain != task.source_domain:
+        raise ValueError(
+            f"--performance-profile-from {donor_id!r} is a {donor.source_domain} task; "
+            f"{task.id!r} is {task.source_domain}"
+        )
+    data = _raw_task_data(task.id)
+    donor_profile = _raw_task_data(donor_id).get("performance_profile")
+    if donor_profile is None:
+        raise ValueError(f"Task {donor_id!r} has no performance_profile to lend")
+    data["performance_profile"] = donor_profile
+    return HyperTauTask(**data)
+
+
 def load_active_hyper_tau_task(
     task_id: str,
     *,

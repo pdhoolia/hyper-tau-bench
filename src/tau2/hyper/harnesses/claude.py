@@ -29,6 +29,15 @@ SKILLS_DIRECTIVE_PATH = "/runtime-home/.claude/CLAUDE.md"
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _DESCRIPTION_RE = re.compile(r"^description:\s*(.+?)\s*$", re.MULTILINE)
+_SUBMIT_GATE_RE = re.compile(r"^submit-gate:\s*(.+?)\s*$", re.MULTILINE)
+# A skill may name a submit gate in its frontmatter (``submit-gate: <command>``):
+# a command run from the skill's own directory before every hyper_tau.submit. It
+# exits 2 to refuse the submit, with the reason on stderr, which Claude Code shows
+# to the Developer; any other exit lets the submit through, so a gate that breaks
+# never traps a build. The driver installs it as a PreToolUse hook on the submit
+# tool, the one hook a skills run turns on; every other hook stays off. The clock
+# still ends a build that never submits, and the workspace is scored as it stands.
+SUBMIT_TOOL = "mcp__hyper_tau__submit"
 # A skill's other files (scripts/, references/, …) ride beside its SKILL.md at
 # the same relative paths. Text only (UTF-8, no NUL byte), each file at most
 # SKILL_FILE_MAX_BYTES and a skill's files together at most
@@ -54,6 +63,13 @@ def _skill_description(content: str) -> str:
         except json.JSONDecodeError:
             return text[1:-1]
     return text
+
+
+def _skill_submit_gate(content: str) -> str | None:
+    """The ``submit-gate:`` command of a SKILL.md's frontmatter, or None."""
+    front = _FRONTMATTER_RE.match(content)
+    found = _SUBMIT_GATE_RE.search(front.group(1)) if front else None
+    return found.group(1).strip() if found else None
 
 
 def _skill_files(skill_dir: Path) -> dict[str, str]:
@@ -121,6 +137,7 @@ def load_skills_dir(skills_dir: str | Path) -> list[dict[str, Any]]:
                 "content": content,
                 "description": _skill_description(content),
                 "files": _skill_files(child),
+                "submit_gate": _skill_submit_gate(content),
             }
         )
     if not skills:
@@ -135,6 +152,22 @@ def skill_files_metadata(skills: list[dict[str, Any]]) -> dict[str, list[str]]:
         for skill in skills
         if skill.get("files")
     }
+
+
+def submit_gate_hooks(skills: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The settings' ``hooks`` for the skills' submit gates, or None when no skill names one."""
+    gates = [
+        {
+            "type": "command",
+            "command": f"cd {SKILLS_PLUGIN_PATH}/skills/{skill['name']} && {skill['submit_gate']}",
+            "timeout": 60,
+        }
+        for skill in skills
+        if skill.get("submit_gate")
+    ]
+    if not gates:
+        return None
+    return {"PreToolUse": [{"matcher": SUBMIT_TOOL, "hooks": gates}]}
 
 
 def render_skills_directive(skills: list[dict[str, Any]]) -> str:
@@ -272,6 +305,9 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
             skill_files = skill_files_metadata(self.skills)
             if skill_files:
                 metadata["skill_files"] = skill_files
+            gates = {s["name"]: s["submit_gate"] for s in self.skills if s.get("submit_gate")}
+            if gates:
+                metadata["submit_gates"] = gates
         return metadata
 
     def reset_build_state(self) -> None:
@@ -360,10 +396,12 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
             include_sample_scenarios_tool=include_sample_scenarios_tool,
             include_skill_tool=bool(self.skills),
         )
+        hooks = submit_gate_hooks(self.skills)
         return json.dumps(
             {
                 "autoMemoryEnabled": False,
-                "disableAllHooks": True,
+                "disableAllHooks": hooks is None,
+                **({"hooks": hooks} if hooks else {}),
                 "disableArtifact": True,
                 "disableBundledSkills": True,
                 "disableClaudeAiConnectors": True,
@@ -462,7 +500,8 @@ class ClaudeCodeSandboxBuilder(NativeSandboxBuilder):
         # Claude Code 2.1.219 loads no skill under --bare, from a --plugin-dir or
         # the home's skills directory alike (checked in the image: the model
         # reports NONE with it and both skills without it). A skills run drops
-        # bare mode; the settings file still disables hooks, and the env keeps
+        # bare mode; the settings file still disables hooks (all but a skill's
+        # submit gate, on the submit tool alone), and the env keeps
         # memory, updates and nonessential traffic off. Nor does --bare load the
         # CLAUDE.md below the runtime home (checked the same way), which is why
         # the skills directive needs the skills run's mode.
