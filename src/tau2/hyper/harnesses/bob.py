@@ -50,7 +50,9 @@ a global rules file ``/runtime-home/.bob/rules/strata-skills.md`` (rendered
 into every mode's prompt under ``global_rules``) tells Bob to activate each
 handed skill before it reads the kit and to keep working until ``submit``, as
 the Claude driver's CLAUDE.md does. The ``use_skill`` frames are the record of
-which skills Bob read (``build_result.skills_read``).
+which skills Bob read (``build_result.skills_read``). The directory's reserved
+child ``_plugins`` (the rest of a Claude Code plugin: agent definitions,
+commands, hooks, MCP servers) is not a skill and Bob is handed none of it.
 """
 
 from __future__ import annotations

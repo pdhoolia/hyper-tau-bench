@@ -514,3 +514,536 @@ def test_skills_without_a_submit_gate_keep_every_hook_off(tmp_path):
     assert "submit_gates" not in builder.harness_identity().config
     bare = json.loads(ClaudeCodeSandboxBuilder("claude-sonnet-4-5").render_runtime_config(include_client_tool=False))
     assert bare["disableAllHooks"] is True and "hooks" not in bare
+
+
+# What an arm carries besides skills: the rest of each plugin, below `_plugins`.
+
+
+def _two_skills(tmp_path):
+    skills = tmp_path / "skills"
+    (skills / "procedure" / "scripts").mkdir(parents=True)
+    (skills / "procedure" / "SKILL.md").write_text(
+        "---\nname: procedure\ndescription: steps\n"
+        "submit-gate: python3 scripts/before_submit.py /workspace --hook\n---\nbody\n"
+    )
+    (skills / "procedure" / "scripts" / "before_submit.py").write_text('print("gate")\n')
+    (skills / "plain").mkdir()
+    (skills / "plain" / "SKILL.md").write_text("---\nname: plain\n---\nbody\n")
+    return skills
+
+
+def _add_plugin(skills):
+    """One plugin with an agent, a command, a hooks.json with its script, and an MCP server."""
+    plugin = skills / "_plugins" / "review-kit"
+    for folder in (".claude-plugin", "agents", "commands", "hooks", "servers"):
+        (plugin / folder).mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "review-kit", "version": "1.2.0", "description": "Review helpers"}\n'
+    )
+    (plugin / "agents" / "policy-reviewer.md").write_text(
+        "---\nname: policy-reviewer\ndescription: Use to review the policy before submit.\n"
+        "tools: Read, Grep, Glob\nmodel: haiku\n---\nYou review a policy file.\n"
+    )
+    (plugin / "commands" / "audit-kit.md").write_text(
+        "---\ndescription: List what the kit holds.\n---\nList the kit's folders.\n"
+    )
+    (plugin / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.mjs",
+                                }
+                            ]
+                        }
+                    ],
+                    "PreToolUse": [{"matcher": "Bash", "hooks": []}],
+                }
+            }
+        )
+    )
+    (plugin / "hooks" / "dispatch.mjs").write_text("process.exit(0);\n")
+    (plugin / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "kit-index": {
+                        "command": "python",
+                        "args": ["${CLAUDE_PLUGIN_ROOT}/servers/kit_index.py"],
+                        "env": {"KIT_ROOT": "${CLAUDE_PLUGIN_ROOT}", "KEPT": "${HOME}"},
+                    }
+                }
+            }
+        )
+    )
+    (plugin / "servers" / "kit_index.py").write_text("print('server')\n")
+    # Left behind: hidden entries other than the two Claude Code reads, and bytecode.
+    (plugin / ".DS_Store").write_bytes(b"\x00\x01")
+    (plugin / ".git").mkdir()
+    (plugin / ".git" / "HEAD").write_text("ref\n")
+    (plugin / "servers" / "__pycache__").mkdir()
+    (plugin / "servers" / "__pycache__" / "kit_index.cpython-312.pyc").write_bytes(b"\x00")
+    (skills / "_plugins" / ".DS_Store").write_bytes(b"\x00")
+    return plugin
+
+
+_SKILLS_ONLY_COMMAND = [
+    "python",
+    "-m",
+    "tau2.hyper.harnesses.turn_loop_driver",
+    "claude",
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "claude-sonnet-4-5",
+    "--permission-mode",
+    "dontAsk",
+    "--tools",
+    "Bash,Edit,Glob,Grep,NotebookEdit,Read,Write,mcp__hyper_tau__run_local_test,mcp__hyper_tau__submit,Skill",
+    "--allowedTools",
+    "Bash,Edit,Glob,Grep,NotebookEdit,Read,Write,mcp__hyper_tau__run_local_test,mcp__hyper_tau__submit,Skill",
+    "--disallowedTools",
+    "WebSearch,WebFetch",
+    "--mcp-config",
+    "/runtime-home/claude-mcp.json",
+    "--strict-mcp-config",
+    "--settings",
+    "/runtime-home/.claude/settings.json",
+    "--no-chrome",
+    "--plugin-dir",
+    "/runtime-home/plugins/strata-skills",
+]
+_SUBMIT_GATE_HOOKS = {
+    "PreToolUse": [
+        {
+            "matcher": "mcp__hyper_tau__submit",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "cd /runtime-home/plugins/strata-skills/skills/procedure"
+                    " && python3 scripts/before_submit.py /workspace --hook",
+                    "timeout": 60,
+                }
+            ],
+        }
+    ]
+}
+_SKILLS_ONLY_DIRECTIVE = (
+    "# Skills for this build\n\n2 skills were handed to you for this build, as the plugin "
+    "`strata-skills`. Before you read the kit, load each one with the Skill tool and follow "
+    "what it says:\n\n- `strata-skills:plain`\n- `strata-skills:procedure` — steps\n\nKeep "
+    "working until you have called `hyper_tau.submit`: a session that ends without it is "
+    "scored as the workspace stands, and the time left in your budget is lost.\n"
+)
+_BROKER = SimpleNamespace(token="callback-token", client_tool_enabled=False)
+
+
+def test_a_skills_dir_with_no_plugins_renders_what_it_did_before(tmp_path):
+    # The literals are what the driver rendered for this directory before it knew `_plugins`.
+    skills = _two_skills(tmp_path)
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+    files = builder.runtime_files(include_client_tool=False)
+
+    assert builder.plugins == []
+    assert builder.harness_command() == _SKILLS_ONLY_COMMAND
+    assert list(files) == [
+        "/runtime-home/.claude/settings.json",
+        "/runtime-home/claude-mcp.json",
+        "/runtime-home/.claude/CLAUDE.md",
+        "/runtime-home/plugins/strata-skills/.claude-plugin/plugin.json",
+        "/runtime-home/plugins/strata-skills/skills/plain/SKILL.md",
+        "/runtime-home/plugins/strata-skills/skills/procedure/SKILL.md",
+        "/runtime-home/plugins/strata-skills/skills/procedure/scripts/before_submit.py",
+    ]
+    assert files[SKILLS_DIRECTIVE_PATH] == _SKILLS_ONLY_DIRECTIVE
+    assert json.loads(files[builder.runtime_config_path]) == {
+        "autoMemoryEnabled": False,
+        "disableAllHooks": False,
+        "disableArtifact": True,
+        "disableBundledSkills": True,
+        "disableClaudeAiConnectors": True,
+        "disableRemoteControl": True,
+        "disableWorkflows": True,
+        "enableAllProjectMcpServers": False,
+        "hooks": _SUBMIT_GATE_HOOKS,
+        "includeGitInstructions": True,
+        "permissions": {
+            "allow": _SKILLS_ONLY_COMMAND[13].split(","),
+            "defaultMode": "dontAsk",
+            "deny": ["WebSearch", "WebFetch"],
+        },
+    }
+    assert list(json.loads(files[builder.mcp_config_path])["mcpServers"]) == ["hyper_tau"]
+    assert builder.harness_config_metadata() == {
+        "interface": "print-stream-json",
+        "permission_mode": "dontAsk-with-explicit-allowlist",
+        "bare_mode": False,
+        "web_tools": "removed",
+        "browser": False,
+        "background_tasks": False,
+        "built_in_agents": False,
+        "memory": False,
+        "session_persistence": "runtime-home-only",
+        "turn_loop": True,
+        "nonessential_traffic": False,
+        "model_gateway": "provider-only/per-run/model-scoped",
+        "gateway_token_inherited_by_shell": True,
+        "inner_bash_sandbox": "disabled/container-is-boundary",
+        "mcp_servers": ["hyper_tau"],
+        "skills": ["plain", "procedure"],
+        "skills_plugin": "strata-skills",
+        "skills_directive": "claude-md",
+        "skill_files": {"procedure": ["scripts/before_submit.py"]},
+        "submit_gates": {"procedure": "python3 scripts/before_submit.py /workspace --hook"},
+    }
+    assert "CLAUDE_CODE_SUBAGENT_MODEL" not in builder.runtime_environment(_BROKER)
+
+    # An empty `_plugins` carries nothing and changes nothing.
+    (skills / "_plugins").mkdir()
+    again = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+    assert again.runtime_files(include_client_tool=False) == files
+    assert again.harness_command() == builder.harness_command()
+    assert again.harness_config_metadata() == builder.harness_config_metadata()
+
+
+def test_claude_hands_over_the_rest_of_a_plugin(tmp_path):
+    skills = _two_skills(tmp_path)
+    plugin = _add_plugin(skills)
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+    files = builder.runtime_files(include_client_tool=False)
+    command = builder.harness_command()
+    root = "/runtime-home/plugins/review-kit"
+
+    # The files: every text file of the plugin at its own path, as it was written.
+    assert sorted(path for path in files if path.startswith(root)) == [
+        f"{root}/.claude-plugin/plugin.json",
+        f"{root}/.mcp.json",
+        f"{root}/agents/policy-reviewer.md",
+        f"{root}/commands/audit-kit.md",
+        f"{root}/hooks/dispatch.mjs",
+        f"{root}/hooks/hooks.json",
+        f"{root}/servers/kit_index.py",
+    ]
+    for relative in ("agents/policy-reviewer.md", "hooks/hooks.json", ".mcp.json"):
+        assert files[f"{root}/{relative}"] == (plugin / relative).read_text()
+    assert all(path.startswith("/runtime-home/") for path in files)
+    # The skills ride as before, in their own plugin.
+    assert files["/runtime-home/plugins/strata-skills/skills/plain/SKILL.md"].endswith("body\n")
+
+    # The command: the skills run's, with the plugin's directory and the tools its parts need.
+    tools = _SKILLS_ONLY_COMMAND[13] + ",Agent,mcp__plugin_review-kit_kit-index"
+    assert command == [
+        *_SKILLS_ONLY_COMMAND[:13],
+        tools,
+        "--allowedTools",
+        tools,
+        *_SKILLS_ONLY_COMMAND[16:],
+        "--plugin-dir",
+        root,
+    ]
+    assert "--bare" not in command and "--disable-slash-commands" not in command
+    assert "--strict-mcp-config" in command
+
+    # The settings: hooks on, the submit gate still the one hook the file names, the same allowlist.
+    settings = json.loads(files[builder.runtime_config_path])
+    assert settings["disableAllHooks"] is False
+    assert settings["hooks"] == _SUBMIT_GATE_HOOKS
+    assert settings["permissions"]["allow"] == tools.split(",")
+    assert settings["permissions"]["deny"] == ["WebSearch", "WebFetch"]
+
+    # The MCP config: the plugin's server beside hyper_tau, under the name Claude Code gives
+    # a plugin's server, with the plugin's root resolved and other variables left to it.
+    servers = json.loads(files[builder.mcp_config_path])["mcpServers"]
+    assert list(servers) == ["hyper_tau", "plugin:review-kit:kit-index"]
+    assert servers["plugin:review-kit:kit-index"] == {
+        "command": "python",
+        "args": [f"{root}/servers/kit_index.py"],
+        "env": {"KIT_ROOT": root, "KEPT": "${HOME}"},
+    }
+
+    # Every sub-agent runs on the run's model: the gateway takes no other.
+    assert builder.runtime_environment(_BROKER)["CLAUDE_CODE_SUBAGENT_MODEL"] == "claude-sonnet-4-5"
+
+    # The record: what was handed, per plugin, under the names the session uses.
+    config = builder.harness_identity().config
+    assert config["plugins"] == {
+        "review-kit": {
+            "path": root,
+            "version": "1.2.0",
+            "agents": ["review-kit:policy-reviewer"],
+            "commands": ["review-kit:audit-kit"],
+            "hook_events": ["PreToolUse", "SessionStart"],
+            "mcp_servers": ["plugin:review-kit:kit-index"],
+            "files": [
+                ".claude-plugin/plugin.json",
+                ".mcp.json",
+                "agents/policy-reviewer.md",
+                "commands/audit-kit.md",
+                "hooks/dispatch.mjs",
+                "hooks/hooks.json",
+                "servers/kit_index.py",
+            ],
+        }
+    }
+    assert config["mcp_servers"] == ["hyper_tau", "plugin:review-kit:kit-index"]
+    assert config["subagent_model"] == "claude-sonnet-4-5"
+    assert config["built_in_agents"] is False and config["bare_mode"] is False
+    # The skills' keys are the ones a skills run records.
+    assert config["skills"] == ["plain", "procedure"]
+    assert config["skills_plugin"] == "strata-skills"
+    assert config["skill_files"] == {"procedure": ["scripts/before_submit.py"]}
+    assert config["submit_gates"] == {
+        "procedure": "python3 scripts/before_submit.py /workspace --hook"
+    }
+
+    # The directive: the skills part as it was, then the agents and commands by name.
+    directive = files[SKILLS_DIRECTIVE_PATH]
+    assert directive.startswith(_SKILLS_ONLY_DIRECTIVE)
+    assert directive[len(_SKILLS_ONLY_DIRECTIVE) :] == (
+        "\n# Agents and commands for this build\n\n"
+        "These were handed to you for this build. Use one when the work calls for it; "
+        "you do not have to use them.\n\n"
+        "Agent definitions, to delegate to with the Agent tool:\n\n"
+        "- `review-kit:policy-reviewer` — Use to review the policy before submit.\n\n"
+        "Commands, to run with the Skill tool:\n\n"
+        "- `review-kit:audit-kit` — List what the kit holds.\n"
+    )
+
+
+def test_a_dir_with_plugins_and_no_skill_is_valid(tmp_path):
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    _add_plugin(skills)
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+    files = builder.runtime_files(include_client_tool=False)
+    command = builder.harness_command()
+    settings = json.loads(files[builder.runtime_config_path])
+    config = builder.harness_identity().config
+
+    assert builder.skills == [] and builder.skills_read([]) is None
+    assert not any(path.startswith("/runtime-home/plugins/strata-skills") for path in files)
+    assert [command[i + 1] for i, arg in enumerate(command) if arg == "--plugin-dir"] == [
+        "/runtime-home/plugins/review-kit"
+    ]
+    assert "--bare" not in command and "--disable-slash-commands" not in command
+    # The Skill tool runs the plugin's command; the Agent tool reaches its agent.
+    assert command[command.index("--tools") + 1].split(",")[-3:] == [
+        "Skill",
+        "Agent",
+        "mcp__plugin_review-kit_kit-index",
+    ]
+    # A plugin's hooks run with no submit gate in the settings file.
+    assert settings["disableAllHooks"] is False and "hooks" not in settings
+    assert "skills" not in config and "skills_directive" not in config
+    assert config["bare_mode"] is False
+    assert list(config["plugins"]) == ["review-kit"]
+    assert files[SKILLS_DIRECTIVE_PATH].startswith("# Agents and commands for this build\n")
+    assert "Skills for this build" not in files[SKILLS_DIRECTIVE_PATH]
+
+    # A plugin of hooks alone: no manifest, no tool added, nothing to name in a CLAUDE.md.
+    hooks_only = tmp_path / "hooks-only"
+    (hooks_only / "_plugins" / "just-hooks" / "hooks").mkdir(parents=True)
+    (hooks_only / "_plugins" / "just-hooks" / "hooks" / "hooks.json").write_text(
+        '{"hooks": {"Stop": []}}'
+    )
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=hooks_only)
+    files = builder.runtime_files(include_client_tool=False)
+    command = builder.harness_command()
+    assert SKILLS_DIRECTIVE_PATH not in files
+    assert command[command.index("--tools") + 1] == ",".join(_SKILLS_ONLY_COMMAND[13].split(",")[:-1])
+    assert json.loads(files[builder.runtime_config_path])["disableAllHooks"] is False
+    assert builder.harness_identity().config["plugins"]["just-hooks"] == {
+        "path": "/runtime-home/plugins/just-hooks",
+        "agents": [],
+        "commands": [],
+        "hook_events": ["Stop"],
+        "mcp_servers": [],
+        "files": ["hooks/hooks.json"],
+    }
+    assert "subagent_model" not in builder.harness_identity().config
+    assert "CLAUDE_CODE_SUBAGENT_MODEL" not in builder.runtime_environment(_BROKER)
+
+    # A plugin with no hooks leaves every hook off, as a run with no gate does.
+    agent_only = tmp_path / "agent-only"
+    (agent_only / "_plugins" / "one-agent" / "agents").mkdir(parents=True)
+    (agent_only / "_plugins" / "one-agent" / "agents" / "helper.md").write_text(
+        "---\nname: helper\ndescription: Helps.\n---\nbody\n"
+    )
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=agent_only)
+    settings = json.loads(builder.runtime_files(include_client_tool=False)[builder.runtime_config_path])
+    assert settings["disableAllHooks"] is True
+    assert settings["permissions"]["allow"][-1] == "Agent"
+    assert "Skill" not in settings["permissions"]["allow"]
+
+
+def test_plugin_parts_are_named_as_the_session_names_them(tmp_path):
+    from tau2.hyper.harnesses.claude import load_plugins_dir, mcp_server_rule
+
+    skills = tmp_path / "skills"
+    plugin = skills / "_plugins" / "probe-dir"
+    for folder in (".claude-plugin", "agents/team", "commands/group"):
+        (plugin / folder).mkdir(parents=True)
+    # The manifest's name is the plugin's, not the directory's.
+    (plugin / ".claude-plugin" / "plugin.json").write_text('{"name": "probe-kit"}')
+    (plugin / "agents" / "reviewer-file.md").write_text(
+        "---\nname: reviewer-name\ndescription: \"" + "x" * 300 + "\"\n---\nbody\n"
+    )
+    (plugin / "agents" / "team" / "helper.md").write_text("---\nname: helper\n---\nbody\n")
+    (plugin / "agents" / "no-name.md").write_text("---\ndescription: No name line.\n---\nbody\n")
+    (plugin / "commands" / "group" / "deep.md").write_text("---\nname: ignored\n---\nbody\n")
+    (plugin / "commands" / "plain.md").write_text("No frontmatter.\n")
+    (plugin / "commands" / "manual-only.md").write_text(
+        "---\ndescription: For a person.\ndisable-model-invocation: true\n---\nbody\n"
+    )
+    # The flat form of .mcp.json, and a server name with a character a tool name cannot hold.
+    (plugin / ".mcp.json").write_text('{"kit.index": {"command": "python"}}')
+
+    (found,) = load_plugins_dir(skills)
+    assert found["name"] == "probe-kit" and found["version"] is None
+    assert found["path"] == "/runtime-home/plugins/probe-dir"
+    assert [agent["name"] for agent in found["agents"]] == [
+        "probe-kit:no-name",
+        "probe-kit:reviewer-name",
+        "probe-kit:team:helper",
+    ]
+    assert [command["name"] for command in found["commands"]] == [
+        "probe-kit:group:deep",
+        "probe-kit:manual-only",
+        "probe-kit:plain",
+    ]
+    assert list(found["mcp_servers"]) == ["plugin:probe-kit:kit.index"]
+    assert mcp_server_rule("plugin:probe-kit:kit.index") == "mcp__plugin_probe-kit_kit_index"
+
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+    record = builder.harness_identity().config["plugins"]["probe-kit"]
+    # A command a person types is carried as a file; the model cannot run it, and the record says so.
+    assert record["commands"] == ["probe-kit:group:deep", "probe-kit:plain"]
+    assert record["commands_user_only"] == ["probe-kit:manual-only"]
+    assert "version" not in record
+    directive = render_skills_directive(builder.skills, builder.plugins)
+    assert "- `probe-kit:plain`\n" in directive
+    assert "manual-only" not in directive
+    assert "- `probe-kit:reviewer-name` — " + "x" * 200 + "…\n" in directive
+    assert builder.harness_command()[-2:] == ["--plugin-dir", "/runtime-home/plugins/probe-dir"]
+
+
+def test_a_plugin_that_breaks_a_rule_is_refused(tmp_path):
+    import pytest
+
+    from tau2.hyper.harnesses.claude import SKILL_FILE_MAX_BYTES, load_plugins_dir
+
+    def fresh(name, plugin="kit"):
+        skills = tmp_path / name
+        (skills / "_plugins" / plugin / "agents").mkdir(parents=True)
+        (skills / "_plugins" / plugin / "agents" / "helper.md").write_text(
+            "---\nname: helper\n---\nbody\n"
+        )
+        return skills, skills / "_plugins" / plugin
+
+    skills, plugin = fresh("binary")
+    (plugin / "logo.png").write_bytes(b"\x89PNG\x00\x00")
+    with pytest.raises(ValueError, match="A plugin file must be text"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("large")
+    (plugin / "big.md").write_text("x" * (SKILL_FILE_MAX_BYTES + 1))
+    with pytest.raises(ValueError, match="A plugin file is over"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("together")
+    for index in range(5):
+        (plugin / f"part{index}.md").write_text("x" * SKILL_FILE_MAX_BYTES)
+    with pytest.raises(ValueError, match="together"):
+        load_plugins_dir(skills)
+
+    (tmp_path / "outside.md").write_text("outside\n")
+    skills, plugin = fresh("linked-file")
+    (plugin / "agents" / "outside.md").symlink_to(tmp_path / "outside.md")
+    with pytest.raises(ValueError, match="symbolic link"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("linked-plugin")
+    (skills / "_plugins" / "other").symlink_to(plugin)
+    with pytest.raises(ValueError, match="symbolic link"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("linked-root")
+    (tmp_path / "linked-root-2").mkdir()
+    (tmp_path / "linked-root-2" / "_plugins").symlink_to(skills / "_plugins")
+    with pytest.raises(ValueError, match="symbolic link"):
+        load_plugins_dir(tmp_path / "linked-root-2")
+
+    skills, plugin = fresh("with-skills")
+    (plugin / "skills" / "s").mkdir(parents=True)
+    (plugin / "skills" / "s" / "SKILL.md").write_text("---\nname: s\n---\nbody\n")
+    with pytest.raises(ValueError, match="top of the skills directory"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("bad-dir-name", plugin="Review_Kit")
+    with pytest.raises(ValueError, match="kebab-case"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("reserved", plugin="strata-skills")
+    with pytest.raises(ValueError, match="strata-skills"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("bad-manifest-name")
+    (plugin / ".claude-plugin").mkdir()
+    (plugin / ".claude-plugin" / "plugin.json").write_text('{"name": "Review Kit"}')
+    with pytest.raises(ValueError, match="kebab-case"):
+        load_plugins_dir(skills)
+
+    skills, plugin = fresh("same-name")
+    (skills / "_plugins" / "twin" / ".claude-plugin").mkdir(parents=True)
+    (skills / "_plugins" / "twin" / ".claude-plugin" / "plugin.json").write_text('{"name": "kit"}')
+    with pytest.raises(ValueError, match="Two plugins"):
+        load_plugins_dir(skills)
+
+    for relative in (".claude-plugin/plugin.json", "hooks/hooks.json", ".mcp.json"):
+        skills, plugin = fresh("not-json-" + relative.replace("/", "-").strip("."))
+        (plugin / relative).parent.mkdir(exist_ok=True)
+        (plugin / relative).write_text("{not json")
+        with pytest.raises(ValueError, match="Not JSON"):
+            load_plugins_dir(skills)
+
+    skills, plugin = fresh("servers-not-objects")
+    (plugin / ".mcp.json").write_text('{"mcpServers": {"a": "python"}}')
+    with pytest.raises(ValueError, match="each server"):
+        load_plugins_dir(skills)
+
+    skills = tmp_path / "empty-plugin"
+    (skills / "_plugins" / "kit" / "agents").mkdir(parents=True)
+    with pytest.raises(ValueError, match="no file"):
+        load_plugins_dir(skills)
+
+    # Neither a skill nor a plugin: still a misconfiguration, as an empty directory is.
+    nothing = tmp_path / "nothing"
+    (nothing / "_plugins").mkdir(parents=True)
+    with pytest.raises(ValueError, match="No <name>/SKILL.md"):
+        ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=nothing)
+
+
+def test_a_plugins_command_named_as_a_skill_is_not_that_skill_read(tmp_path):
+    skills = _two_skills(tmp_path)
+    plugin = _add_plugin(skills)
+    (plugin / "commands" / "procedure.md").write_text("---\ndescription: Same name.\n---\nbody\n")
+    builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
+
+    def step(skill):
+        return BuildStep(
+            step_idx=0,
+            role="assistant",
+            tool_calls=[{"id": "t", "name": "Skill", "arguments": {"skill": skill}}],
+        )
+
+    assert builder.skills_read([step("review-kit:procedure")]) == []
+    assert builder.skills_read([step("review-kit:procedure"), step("strata-skills:procedure")]) == [
+        "procedure"
+    ]
+    assert builder.skills_read([step("procedure"), step("/plain")]) == ["procedure", "plain"]

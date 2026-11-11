@@ -1176,7 +1176,11 @@ def main():
             "A directory of skills (<name>/SKILL.md per child, with any text "
             "files beside it, such as scripts/ and references/) the Developer "
             "harness loads for this run, below its private runtime home; the "
-            "kit is untouched. Claude Code and Bob."
+            "kit is untouched. Claude Code and Bob. For Claude Code the "
+            "directory may also hold _plugins/<plugin>/ with the rest of a "
+            "plugin: agents/<name>.md, commands/<name>.md, hooks/hooks.json, "
+            ".mcp.json and an optional .claude-plugin/plugin.json (a plugin's "
+            "skills stay at the top of the directory). Bob skips _plugins."
         ),
     )
     hyper_tau_parser.add_argument(
