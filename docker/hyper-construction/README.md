@@ -75,3 +75,66 @@ their presence does not create an internet route.
 
 See [Sealed scoring](../../README.md#sealed-scoring) in the repository README
 for the trust boundary and data-flow contract.
+
+## The same build as pods (Kubernetes, OpenShift)
+
+Docker is the default. `TAU2_SANDBOX_BACKEND=kubernetes` starts a build's
+containers as pods through the cluster's command line instead
+(`src/tau2/hyper/sandbox/kube_runtime.py`). The benchmark still runs on the
+host; only the containers move.
+
+```bash
+export TAU2_SANDBOX_BACKEND=kubernetes
+export TAU2_KUBE_CLI=oc                       # default kubectl
+export TAU2_KUBE_NAMESPACE=hyper-trial        # default: the current context's
+export TAU2_KUBE_IMAGE=image-registry.openshift-image-registry.svc:5000/hyper-trial/tau2-construction-runtime:$REVISION
+export TAU2_KUBE_USAGE_LOG=usage.jsonl        # optional: one line per pod when it ends (peak memory, CPU seconds)
+uv run tau2 hyper-tau <task> --developer-harness claude-code …
+```
+
+`TAU2_KUBE_IMAGE` is this image as the cluster pulls it (a Docker image name
+is a name in the machine's daemon). `TAU2_KUBE_CONTEXT` names a context other
+than the current one.
+
+| Docker | Pods |
+|---|---|
+| the sandbox container, `sleep infinity`, commands by `docker exec` | a pod that sleeps, commands by `exec` |
+| the model gateway sidecar on the internal network | a pod beside it, behind a Service of its own; its keys in a Secret |
+| the internal network (`--internal`) | two NetworkPolicies: the sandbox reaches the model gateway's port and nothing else, and nothing reaches the sandbox |
+| the scoring container, `--network none`, fed over standard input | a pod with a NetworkPolicy that lets nothing in or out, fed over the standard input of an `exec` |
+| the kit bound at `/workspace` | the kit copied into a volume of the sandbox pod, copied out before every callback and when the build ends; what the host writes during a callback is copied back in |
+| the callback folder bound at `/run/tau2-callback` | a volume, with a relay that carries each request file out and each response back over one `exec` |
+
+Every pod asks for nothing privileged and names no user id: no capability, no
+privilege escalation, the runtime's default seccomp profile, `runAsNonRoot`,
+no service account token. A cluster that assigns the user id (OpenShift's
+`restricted-v2`) admits them, and the image's writable folders belong to group
+0 for that. The rights the path needs are those of a project's admin: pods,
+`pods/exec`, `pods/log`, services, secrets and network policies in one
+namespace.
+
+The sandbox and scoring pods have no name service (the rule would drop a
+lookup silently and a library would wait out the resolver's timeout), so a
+lookup there fails at once; the sandbox finds the model gateway by a hosts
+line. The scoring pod's kit is a copy without its Git metadata and without
+write bits.
+
+What a build leaves behind after a crash of the host carries the labels
+`tau2.hyper/build` and `tau2.hyper/role`:
+
+```bash
+oc delete pod,service,secret,networkpolicy -l tau2.hyper/build
+oc delete pod -l tau2.hyper/role=scoring
+```
+
+A task's `docker_memory` and `docker_cpus` are ceilings under Docker, so here
+they are the pod's limits and never its requests: eight scoring pods that each
+reserved 2 CPUs would wait for a node that runs them side by side. Each kind
+of pod requests what one was measured to use (`REQUESTS` in `kube_runtime.py`:
+the sandbox 250m and 768Mi, a scoring pod 100m and 256Mi, the model gateway
+50m and 64Mi).
+
+Only a Claude Code build has been run on this path. Not there yet: the other
+harnesses, a user id for a cluster that assigns none, limits for a task that
+names none, a build stopped from outside, and a kit copy that sends only what
+changed.

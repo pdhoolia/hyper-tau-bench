@@ -144,6 +144,8 @@ class CandidateProcess:
         self._stderr_tail: deque[str] = deque(maxlen=80)
         self._stdout_lines: queue.Queue[Optional[str]] = queue.Queue(maxsize=1024)
         self.model_gateway = None
+        # The scoring pod, when the build's containers are pods (see _start).
+        self._pod = None
         _ensure_kit_world_readable(self.config.kit_path.resolve())
         self._process = self._start()
         self._stdout_thread = threading.Thread(
@@ -207,24 +209,53 @@ class CandidateProcess:
             command.extend(["--memory", str(self.config.memory)])
         if self.config.cpus:
             command.extend(["--cpus", str(self.config.cpus)])
-        command.extend(
-            [
-                self.config.image,
-                "python",
-                "-I",
-                "-c",
-                (
-                    "import sys;"
-                    "sys.path.insert(0, '/opt/tau2/src');"
-                    "sys.path.append('/workspace');"
-                    "from tau2.hyper.sandbox.candidate_server import main;"
-                    "main()"
-                ),
-            ]
-        )
+        command.extend([self.config.image, *self._candidate_server_command()])
         return command
 
+    def _candidate_server_command(self) -> list[str]:
+        """The candidate server, with the trusted runtime ahead of the kit on the path."""
+        return [
+            "python",
+            "-I",
+            "-c",
+            (
+                "import sys;"
+                "sys.path.insert(0, '/opt/tau2/src');"
+                "sys.path.append('/workspace');"
+                "from tau2.hyper.sandbox.candidate_server import main;"
+                "main()"
+            ),
+        ]
+
+    def _start_in_pod(self) -> subprocess.Popen:
+        """The same candidate server in a pod with no network, fed by exec.
+
+        The pod is admitted with nothing privileged and no user id of its own
+        choosing; a NetworkPolicy lets nothing in or out; the kit is a copy
+        without its write bits.
+        """
+        from tau2.hyper.sandbox.kube_runtime import start_candidate_pod
+
+        self._pod = start_candidate_pod(
+            image=self.config.image,
+            kit_path=self.config.kit_path.resolve(),
+            memory=self.config.memory,
+            cpus=self.config.cpus,
+        )
+        return subprocess.Popen(
+            self._pod.exec_argv(self._candidate_server_command()),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
     def _start(self) -> subprocess.Popen:
+        from tau2.hyper.sandbox.kube_runtime import KUBE_BACKEND, sandbox_backend
+
+        if sandbox_backend() == KUBE_BACKEND:
+            return self._start_in_pod()
         try:
             return subprocess.Popen(
                 self._build_command(),
@@ -415,9 +446,16 @@ class CandidateProcess:
                     )
                 return response.get("result")
 
+    def _remove_pod(self) -> None:
+        pod = getattr(self, "_pod", None)
+        if pod is not None:
+            self._pod = None
+            pod.delete()
+
     def close(self) -> None:
         process = getattr(self, "_process", None)
         if process is None:
+            self._remove_pod()
             return
         if process.stdin is not None:
             try:
@@ -433,6 +471,7 @@ class CandidateProcess:
             except subprocess.TimeoutExpired:
                 process.kill()
         self._process = None
+        self._remove_pod()
 
     def __del__(self):
         try:
