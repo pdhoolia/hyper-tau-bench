@@ -119,7 +119,65 @@ lookup there fails at once; the sandbox finds the model gateway by a hosts
 line. The scoring pod's kit is a copy without its Git metadata and without
 write bits.
 
-What a build leaves behind after a crash of the host carries the labels
+### Builds started from outside (a runner in the cluster)
+
+Whoever starts builds from outside marks what each one makes, so that a build
+that was stopped or lost can be found and removed. Every setting is optional:
+
+```bash
+export TAU2_KUBE_LABELS=strata.runner=openshift,strata.build=41-1   # labels of the caller's own on every object a build makes
+export TAU2_KUBE_OWNER_POD=strata-runner-7c9d                       # a pod of the same namespace that owns them all:
+export TAU2_KUBE_OWNER_UID=$(oc get pod strata-runner-7c9d -o jsonpath='{.metadata.uid}')   # removed with it by the cluster
+export TAU2_KUBE_PULL_SECRETS=icr-image-pull                        # the Secrets the build's pods pull the image with
+export TAU2_KUBE_RESOURCES='{"scoring":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1","memory":"768Mi"}}}'
+export TAU2_KUBE_LOG_DIR=pods                                       # keeps what goes with a pod (below)
+```
+
+- **The marks.** The labels and the owner go on the sandbox, the model gateway,
+  its Service and its Secret, the build's two NetworkPolicies and every scoring
+  pod. A scoring pod has no other label that names its build. The one rule all
+  scoring pods share (`tau2-hyper-scoring`) is no build's and is not marked:
+  removed with one build, it would open the others'.
+- **Requests and limits.** `TAU2_KUBE_RESOURCES` is an object keyed by the
+  pod's kind (`sandbox`, `model-gateway`, `scoring`). `requests` there replaces
+  the measured requests, `limits` replaces the task's ceilings, and an empty
+  object takes them away. A kind it does not name keeps what it had. Use it
+  where a quota counts limits.
+- **A full quota.** A pod the project's quota refuses is tried again every five
+  seconds for as long as a pod gets to become ready
+  (`TAU2_KUBE_READY_TIMEOUT_SECONDS`, 300), not failed: the pods of other
+  builds end by themselves.
+- **What is kept.** With `TAU2_KUBE_LOG_DIR` the model gateway's log is written
+  there before its pod is removed (`<pod>.log`), and `pods.jsonl` gets one line
+  per pod: its peak memory and CPU seconds, `oom_kills` when a process was
+  killed at the pod's memory limit (the pod stays, the process is gone), or
+  `ended` with the cluster's reason for a pod that was no longer running
+  (evicted, say). The same reasons are warnings in the run's log.
+- **A stop.** SIGINT and SIGTERM both end `tau2 hyper-tau` as Ctrl-C does: the
+  build closes, copies the kit out and removes what it made. A build that was
+  killed removes nothing; the sweep below does.
+
+Two commands, each printing one JSON object, reading the same environment:
+
+```bash
+# What builds with these labels left, removed: pods first, then each build's Secret (by its
+# name: the path needs no right to list Secrets), Service and rules.
+uv run python -m tau2.hyper.sandbox.kube_tools sweep --selector strata.build=41-1
+
+# Is a sandbox pod isolated on this cluster? A sandbox behind a build's own rules and a
+# control pod with none try the same addresses. `isolated` is true (the control reached
+# one, the sandbox none), false (the sandbox reached one: the network plugin does not
+# enforce NetworkPolicy), or null (nothing answered the control, so nothing was tested).
+# It also says the sandbox's user id and whether each named harness's command starts there.
+uv run python -m tau2.hyper.sandbox.kube_tools probe \
+  --target gateway.strata.svc.cluster.local:8080 --target 1.1.1.1:443 \
+  --harness claude-code --harness codex --harness opencode
+```
+
+`probe --no-rules` leaves the build's rules out and shows the answer of a
+cluster that enforces none.
+
+What a build leaves behind where no labels were set carries this path's own,
 `tau2.hyper/build` and `tau2.hyper/role`:
 
 ```bash
@@ -134,7 +192,9 @@ of pod requests what one was measured to use (`REQUESTS` in `kube_runtime.py`:
 the sandbox 250m and 768Mi, a scoring pod 100m and 256Mi, the model gateway
 50m and 64Mi).
 
-Only a Claude Code build has been run on this path. Not there yet: the other
-harnesses, a user id for a cluster that assigns none, limits for a task that
-names none, a build stopped from outside, and a kit copy that sends only what
-changed.
+Only a Claude Code build has been run on this path. The other harnesses go
+through the same three calls of the sandbox, and `probe --harness` says whether
+each one's command starts under the user id the cluster assigns; none has built
+as pods. Not there yet: a user id for a cluster that assigns none (the image
+names no user, so a plain Kubernetes refuses a pod that must not run as root),
+and a kit copy that sends only what changed.

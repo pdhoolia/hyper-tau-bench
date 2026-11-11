@@ -1515,6 +1515,20 @@ def _build_hyper_tau_llm_args(
     return args_dict if args_dict else None
 
 
+def _end_on_sigterm() -> None:
+    """A stop from outside (a supervisor's SIGTERM) ends the run as Ctrl-C does.
+
+    The build then closes and removes its containers or pods before the
+    process ends, where the default action would leave them behind.
+    """
+    import signal
+
+    try:
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
+    except ValueError:
+        pass  # not the main thread: the caller owns the signals
+
+
 def run_hyper_tau(args):
     """Run a Hyper-τ outer-loop evaluation with live visualization.
 
@@ -1528,6 +1542,8 @@ def run_hyper_tau(args):
     import sys
 
     from rich.console import Console
+
+    _end_on_sigterm()
 
     # Notice on stderr so scripts that parse stdout aren't affected.
     # `stderr=True` is a `Console.__init__` argument, not a `print()` kwarg.
