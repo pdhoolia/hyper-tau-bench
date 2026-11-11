@@ -304,6 +304,30 @@ def test_skills_directive_names_each_skill_with_its_description(tmp_path):
         in directive
     )
     assert "- `strata-skills:tau-agent-construction`\n" in directive
+    # Several skills: all of them first, whatever a description says.
+    assert (
+        "Load all 2 before anything else: your first message is 2 Skill calls, one for "
+        "each skill. Each was picked for this build, so load it whatever its description "
+        "says about when to use it, and even when another one is a complete procedure. "
+        "A description is not the skill's text, and a skill that is not loaded is never "
+        "read. Then follow them together.\n" in directive
+    )
+    assert directive.index("Load all 2") > directive.index("- `strata-skills:tau-agent-construction`")
+    assert directive.index("Load all 2") < directive.index("Keep working until")
+
+
+def test_one_skill_renders_the_directive_it_always_did():
+    # The families measured on one skill keep their instruction byte for byte.
+    directive = render_skills_directive(
+        [{"name": "procedure", "content": "", "description": "steps", "files": {}}]
+    )
+    assert directive == (
+        "# Skills for this build\n\nOne skill was handed to you for this build, as the plugin "
+        "`strata-skills`. Before you read the kit, load each one with the Skill tool and follow "
+        "what it says:\n\n- `strata-skills:procedure` — steps\n\nKeep working until you have "
+        "called `hyper_tau.submit`: a session that ends without it is scored as the workspace "
+        "stands, and the time left in your budget is lost.\n"
+    )
 
 
 def _stdout(elapsed: float, frame: dict) -> NativeProcessEvent:
@@ -637,15 +661,21 @@ _SUBMIT_GATE_HOOKS = {
 _SKILLS_ONLY_DIRECTIVE = (
     "# Skills for this build\n\n2 skills were handed to you for this build, as the plugin "
     "`strata-skills`. Before you read the kit, load each one with the Skill tool and follow "
-    "what it says:\n\n- `strata-skills:plain`\n- `strata-skills:procedure` — steps\n\nKeep "
-    "working until you have called `hyper_tau.submit`: a session that ends without it is "
-    "scored as the workspace stands, and the time left in your budget is lost.\n"
+    "what it says:\n\n- `strata-skills:plain`\n- `strata-skills:procedure` — steps\n\nLoad "
+    "all 2 before anything else: your first message is 2 Skill calls, one for each skill. "
+    "Each was picked for this build, so load it whatever its description says about when to "
+    "use it, and even when another one is a complete procedure. A description is not the "
+    "skill's text, and a skill that is not loaded is never read. Then follow them "
+    "together.\n\nKeep working until you have called `hyper_tau.submit`: a session that "
+    "ends without it is scored as the workspace stands, and the time left in your budget is "
+    "lost.\n"
 )
 _BROKER = SimpleNamespace(token="callback-token", client_tool_enabled=False)
 
 
 def test_a_skills_dir_with_no_plugins_renders_what_it_did_before(tmp_path):
-    # The literals are what the driver rendered for this directory before it knew `_plugins`.
+    # The literals are what the driver rendered for this directory before it knew `_plugins`,
+    # with the paragraph that two skills or more now get (load all of them first).
     skills = _two_skills(tmp_path)
     builder = ClaudeCodeSandboxBuilder("claude-sonnet-4-5", skills_dir=skills)
     files = builder.runtime_files(include_client_tool=False)

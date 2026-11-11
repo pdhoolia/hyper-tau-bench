@@ -22,7 +22,10 @@ CLAUDE_CODE_HARNESS_VERSION = "2.1.219"
 # system reminder in the first user message, carried by every later call), tells
 # the Developer to load each skill with the Skill tool before it reads the kit: a
 # skill that is only described is never read (the first runs showed it), and a
-# skill that is never read measures nothing.
+# skill that is never read measures nothing. With more than one skill it also
+# says to load all of them first, whatever a description says: builds that
+# carried several loaded the one that reads as the build's procedure and never
+# the rest. One skill renders as it always did.
 SKILLS_PLUGIN_NAME = "strata-skills"
 SKILLS_PLUGIN_PATH = f"/runtime-home/plugins/{SKILLS_PLUGIN_NAME}"
 SKILLS_DIRECTIVE_PATH = "/runtime-home/.claude/CLAUDE.md"
@@ -424,6 +427,16 @@ def render_skills_directive(
                 f"- `{SKILLS_PLUGIN_NAME}:{skill['name']}`"
                 + (f" — {description}" if description else "")
             )
+        if len(skills) > 1:
+            lines += [
+                "",
+                f"Load all {len(skills)} before anything else: your first message is "
+                f"{len(skills)} Skill calls, one for each skill. Each was picked for this "
+                "build, so load it whatever its description says about when to use it, "
+                "and even when another one is a complete procedure. A description is not "
+                "the skill's text, and a skill that is not loaded is never read. Then "
+                "follow them together.",
+            ]
         lines += [
             "",
             "Keep working until you have called `hyper_tau.submit`: a session that ends "

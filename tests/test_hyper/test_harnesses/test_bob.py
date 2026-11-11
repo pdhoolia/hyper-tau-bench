@@ -14,6 +14,7 @@ from tau2.hyper.harnesses.bob import (
     BOB_STORE_DIR,
     BOB_SUBMIT_GRACE_SECONDS,
     BobShellSandboxBuilder,
+    render_bob_skills_directive,
 )
 from tau2.hyper.sandbox.builder import SandboxBuilder
 from tau2.hyper.sandbox.model_gateway import (
@@ -395,6 +396,24 @@ def test_bob_skills_dir_rides_below_the_runtime_home_with_a_global_rule(tmp_path
     assert "use_skill" in rule
     assert "- `tau-agent-construction` — Use when building the agent." in rule
     assert "hyper_tau.submit" in rule
+    # Several skills: all of them first, whatever a description says.
+    assert (
+        "Activate all 2 before anything else, one use_skill call for each skill. Each was "
+        "picked for this build, so activate it whatever its description says about when to "
+        "use it, and even when another one is a complete procedure. A description is not "
+        "the skill's text, and a skill that is not activated is never read. Then follow "
+        "them together.\n" in rule
+    )
+    one = render_bob_skills_directive(
+        [{"name": "procedure", "content": "", "description": "steps", "files": {}}]
+    )
+    assert one == (
+        "# Skills for this build\n\nOne skill was handed to you for this build. Before you "
+        "read the kit, activate each one with the use_skill tool and follow what it says:"
+        "\n\n- `procedure` — steps\n\nKeep working until you have called `hyper_tau.submit`: "
+        "a session that ends without it is scored as the workspace stands, and the time left "
+        "in your budget is lost.\n"
+    ), "one skill renders the rule it always did"
     # The command is unchanged: Bob finds global skills and rules on its own.
     assert "--skills" not in " ".join(builder.harness_command())
 
