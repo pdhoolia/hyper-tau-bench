@@ -113,6 +113,16 @@ def render_bob_skills_directive(skills: list[dict[str, Any]]) -> str:
         lines.append(
             f"- `{skill['name']}`" + (f" — {description}" if description else "")
         )
+    if len(skills) > 1:
+        # As the Claude driver's CLAUDE.md: several skills are all activated first.
+        lines += [
+            "",
+            f"Activate all {len(skills)} before anything else, one use_skill call for "
+            "each skill. Each was picked for this build, so activate it whatever its "
+            "description says about when to use it, and even when another one is a "
+            "complete procedure. A description is not the skill's text, and a skill "
+            "that is not activated is never read. Then follow them together.",
+        ]
     lines += [
         "",
         "Keep working until you have called `hyper_tau.submit`: a session that ends "
