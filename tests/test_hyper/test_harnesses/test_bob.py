@@ -490,3 +490,35 @@ def test_bob_carries_a_skills_other_files_beside_its_skill_md(tmp_path):
     assert builder.harness_identity().config["skill_files"] == {
         "construction-procedure": ["scripts/preflight.py"]
     }
+
+
+def test_bob_is_handed_nothing_of_the_plugins_child(tmp_path):
+    # `_plugins` holds the rest of a Claude Code plugin (agents, commands, hooks, MCP
+    # servers). It has no SKILL.md, so Bob's driver skips it as it skips any such child.
+    skills = _skills_dir(tmp_path)
+    without = BobShellSandboxBuilder("bob-default", skills_dir=skills)
+    plugin = skills / "_plugins" / "review-kit"
+    (plugin / "agents").mkdir(parents=True)
+    (plugin / "agents" / "policy-reviewer.md").write_text(
+        "---\nname: policy-reviewer\ndescription: Reviews.\n---\nbody\n"
+    )
+    (plugin / ".mcp.json").write_text('{"mcpServers": {"kit-index": {"command": "python"}}}')
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks" / "hooks.json").write_text('{"hooks": {"Stop": []}}')
+    carried = BobShellSandboxBuilder("bob-default", skills_dir=skills)
+
+    files = carried.runtime_files(include_client_tool=False)
+    assert files == without.runtime_files(include_client_tool=False)
+    assert not any("_plugins" in path or "review-kit" in path for path in files)
+    assert carried.harness_command() == without.harness_command()
+    assert carried.harness_identity().config == without.harness_identity().config
+    assert "plugins" not in carried.harness_identity().config
+
+    # A directory of plugin parts alone is no skills directory for Bob.
+    import pytest
+
+    only = tmp_path / "only"
+    (only / "_plugins" / "review-kit" / "agents").mkdir(parents=True)
+    (only / "_plugins" / "review-kit" / "agents" / "a.md").write_text("---\nname: a\n---\nb\n")
+    with pytest.raises(ValueError, match="No <name>/SKILL.md"):
+        BobShellSandboxBuilder("bob-default", skills_dir=only)

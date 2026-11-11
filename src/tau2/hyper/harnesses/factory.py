@@ -23,7 +23,10 @@ def create_developer_builder(
 
     ``developer_skills_dir`` names a directory of skills (one ``SKILL.md`` per
     child directory, with the text files beside it) the harness loads for the
-    run; Claude Code and Bob take one.
+    run; Claude Code and Bob take one. Its reserved child ``_plugins`` holds
+    the rest of each plugin the run carries (agent definitions, commands,
+    hooks, MCP servers), one directory per plugin: Claude Code loads them,
+    Bob skips the child.
     ``developer_artifacts_dir`` is where what the harness kept below its private
     runtime home is copied after the build (Bob's task store and its spans);
     a harness that keeps nothing copies nothing.
