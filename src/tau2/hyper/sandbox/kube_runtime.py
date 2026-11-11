@@ -19,16 +19,24 @@ assigns one (OpenShift's ``restricted-v2``) admits it. The rights it needs are
 those of a project's admin: pods, ``pods/exec``, ``pods/log``, services,
 secrets and network policies in one namespace.
 
-Only what a Claude Code build needs is here. A harness that keeps a record
-below its runtime home can read it out (``read_runtime_tree``), but no other
-harness has been run on this path.
+Whoever starts builds from outside (a runner in the cluster) marks what each
+build makes: labels of its own and an owner on every object, so that a build
+that was stopped or lost can be found and removed (``kube_tools sweep``), and
+so that the cluster removes it all when the owner goes. The same settings name
+the pull secrets, and the requests and limits where a quota asks for them.
+
+Only a Claude Code build has been run on this path. The other harnesses use
+the same three calls (``run``, ``write_runtime_file``, ``read_runtime_tree``);
+``kube_tools probe`` says whether each one starts in a sandbox pod.
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -36,7 +44,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
 
@@ -142,7 +150,10 @@ while True:
         beat = time.monotonic()
     time.sleep(0.05)
 """
-_USAGE_PROBE = "cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo; cat /sys/fs/cgroup/cpu.stat"
+_USAGE_PROBE = (
+    "cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo; cat /sys/fs/cgroup/cpu.stat; "
+    "cat /sys/fs/cgroup/memory.events 2>/dev/null"
+)
 
 
 def sandbox_backend() -> str:
@@ -153,6 +164,54 @@ def sandbox_backend() -> str:
             f"{BACKEND_ENV} must be {DOCKER_BACKEND!r} or {KUBE_BACKEND!r}, not {value!r}"
         )
     return value
+
+
+_LABEL_KEY = re.compile(r"^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$")
+_LABEL_VALUE = re.compile(r"^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$")
+
+
+def _parse_labels(value: Optional[str]) -> tuple[tuple[str, str], ...]:
+    """``key=value,key=value`` as labels; one the cluster would refuse is refused here."""
+    labels = []
+    for item in (value or "").split(","):
+        if not item.strip():
+            continue
+        key, separator, label = item.strip().partition("=")
+        if (
+            not separator
+            or not _LABEL_KEY.match(key)
+            or not _LABEL_VALUE.match(label)
+            or len(label) > 63
+            or key.startswith("tau2.hyper/")
+        ):
+            raise ValueError(
+                f"TAU2_KUBE_LABELS takes key=value pairs that are valid labels, "
+                f"and none under tau2.hyper/: {item!r}"
+            )
+        labels.append((key, label))
+    return tuple(labels)
+
+
+def _parse_resources(value: Optional[str]) -> dict:
+    """``{"scoring": {"requests": {…}, "limits": {…}}, …}`` by the pod's kind."""
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"TAU2_KUBE_RESOURCES is not JSON: {exc}") from exc
+    roles = (ROLE_SANDBOX, ROLE_GATEWAY, ROLE_SCORING)
+    if not isinstance(parsed, dict) or any(role not in roles for role in parsed):
+        raise ValueError(f"TAU2_KUBE_RESOURCES is an object keyed by {', '.join(roles)}")
+    for role, resources in parsed.items():
+        if not isinstance(resources, dict) or any(
+            key not in ("requests", "limits") or not isinstance(entry, dict)
+            for key, entry in resources.items()
+        ):
+            raise ValueError(
+                f"TAU2_KUBE_RESOURCES.{role} takes requests and limits, each an object"
+            )
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -169,10 +228,43 @@ class KubeSettings:
     # A file that gets one JSON line per pod when it ends: its peak memory and
     # the CPU seconds it used, from the pod's own counters.
     usage_log: Optional[str] = None
+    # Labels of the caller's own on everything a build makes, beside this
+    # path's two: who started the build, so that it can be found from outside.
+    labels: tuple[tuple[str, str], ...] = ()
+    # The pod that owns everything a build makes (a runner's own pod, in the
+    # same namespace): when it is removed, the cluster removes the rest.
+    owner_pod: Optional[str] = None
+    owner_uid: Optional[str] = None
+    # The Secrets the build's pods pull the image with.
+    pull_secrets: tuple[str, ...] = ()
+    # Requests and limits by the pod's kind (sandbox, model-gateway, scoring),
+    # in place of the measured requests and the task's ceilings: for a quota
+    # that counts limits, or a cluster with other numbers.
+    resources: dict = field(default_factory=dict)
+    # A folder that keeps what goes with a pod: the model gateway's log, and
+    # one line per pod with its counters or the reason it ended.
+    log_dir: Optional[str] = None
 
     @classmethod
     def from_environment(cls) -> "KubeSettings":
+        owner_pod = os.environ.get("TAU2_KUBE_OWNER_POD") or None
+        owner_uid = os.environ.get("TAU2_KUBE_OWNER_UID") or None
+        if bool(owner_pod) != bool(owner_uid):
+            raise ValueError(
+                "TAU2_KUBE_OWNER_POD and TAU2_KUBE_OWNER_UID go together: "
+                "an owner is a pod's name and its uid"
+            )
         return cls(
+            labels=_parse_labels(os.environ.get("TAU2_KUBE_LABELS")),
+            owner_pod=owner_pod,
+            owner_uid=owner_uid,
+            pull_secrets=tuple(
+                name.strip()
+                for name in (os.environ.get("TAU2_KUBE_PULL_SECRETS") or "").split(",")
+                if name.strip()
+            ),
+            resources=_parse_resources(os.environ.get("TAU2_KUBE_RESOURCES")),
+            log_dir=os.environ.get("TAU2_KUBE_LOG_DIR") or None,
             cli=os.environ.get("TAU2_KUBE_CLI") or "kubectl",
             namespace=os.environ.get("TAU2_KUBE_NAMESPACE") or None,
             context=os.environ.get("TAU2_KUBE_CONTEXT") or None,
@@ -234,17 +326,71 @@ def kube(
         ) from exc
 
 
-def _create(settings: KubeSettings, manifest: dict, *, apply: bool = False) -> None:
-    result = kube(
-        settings,
-        ["apply" if apply else "create", "-f", "-"],
-        input=json.dumps(manifest),
-    )
-    if result.returncode != 0:
+def stamped(settings: KubeSettings, manifest: dict) -> dict:
+    """The manifest as the settings mark it: whose it is, and what a pod pulls with and asks for.
+
+    The caller's labels and the owner go on every object a build makes. A pod
+    also gets the pull secrets, and the requests and limits the settings name
+    for its kind; a kind they do not name keeps what the manifest has.
+    """
+    marked = copy.deepcopy(manifest)
+    metadata = marked.setdefault("metadata", {})
+    if settings.labels:
+        metadata["labels"] = {**dict(settings.labels), **metadata.get("labels", {})}
+    if settings.owner_pod and settings.owner_uid:
+        metadata["ownerReferences"] = [
+            {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "name": settings.owner_pod,
+                "uid": settings.owner_uid,
+            }
+        ]
+    if marked.get("kind") != "Pod":
+        return marked
+    spec = marked["spec"]
+    if settings.pull_secrets:
+        spec["imagePullSecrets"] = [{"name": name} for name in settings.pull_secrets]
+    named = settings.resources.get(metadata.get("labels", {}).get(LABEL_ROLE))
+    if named:
+        for container in spec.get("containers", []):
+            resources = dict(container.get("resources") or {})
+            for key in ("requests", "limits"):
+                if key in named:
+                    resources[key] = dict(named[key])
+            container["resources"] = {k: v for k, v in resources.items() if v}
+    return marked
+
+
+# A project's quota refuses a pod with these words. The pods of other builds
+# end by themselves, so the refusal is waited out, not passed on as a failure.
+_QUOTA_REFUSAL = "exceeded quota"
+_QUOTA_RETRY_SECONDS = 5.0
+
+
+def _create(
+    settings: KubeSettings, manifest: dict, *, apply: bool = False, shared: bool = False
+) -> None:
+    """Make one object. ``shared`` is for what no single build owns: it is not marked."""
+    body = json.dumps(manifest if shared else stamped(settings, manifest))
+    kind = manifest.get("kind")
+    name = manifest.get("metadata", {}).get("name")
+    deadline = time.monotonic() + settings.ready_timeout_seconds
+    waited = False
+    while True:
+        result = kube(settings, ["apply" if apply else "create", "-f", "-"], input=body)
+        if result.returncode == 0:
+            return
         detail = result.stderr.strip() or result.stdout.strip()
-        kind = manifest.get("kind")
-        name = manifest.get("metadata", {}).get("name")
-        raise RuntimeError(f"Failed to create {kind} {name}: {detail}")
+        if _QUOTA_REFUSAL not in detail or time.monotonic() >= deadline:
+            raise RuntimeError(f"Failed to create {kind} {name}: {detail}")
+        if not waited:
+            logger.warning(
+                f"The project's quota is full; waiting for room for {kind} {name}: "
+                f"{detail[-300:]}"
+            )
+            waited = True
+        time.sleep(_QUOTA_RETRY_SECONDS)
 
 
 def _wait_ready(settings: KubeSettings, pod: str) -> None:
@@ -662,24 +808,98 @@ def read_pod_usage(settings: KubeSettings, pod: str) -> Optional[dict]:
         usage["memory_peak_bytes"] = int(lines[0].strip())
     for line in lines[1:]:
         parts = line.split()
-        if len(parts) == 2 and parts[0] == "usage_usec" and parts[1].isdigit():
+        if len(parts) != 2 or not parts[1].isdigit():
+            continue
+        if parts[0] == "usage_usec":
             usage["cpu_seconds"] = int(parts[1]) / 1_000_000
+        elif parts[0] == "oom_kill" and int(parts[1]) > 0:
+            # A process that went over the pod's memory limit: the pod stays, the process is gone.
+            usage["oom_kills"] = int(parts[1])
     return usage or None
 
 
+def pod_end_reason(settings: KubeSettings, pod: str) -> Optional[str]:
+    """Why a pod is no longer running, in the cluster's words; ``None`` while it runs or when it is gone."""
+    try:
+        status = _jsonpath(
+            settings,
+            f"pod/{pod}",
+            "{.status.phase}|{.status.reason}|{.status.message}|"
+            "{.status.containerStatuses[0].state.terminated.reason}|"
+            "{.status.containerStatuses[0].state.terminated.exitCode}",
+        )
+    except RuntimeError:
+        return None
+    phase, reason, message, ended, code = (status.split("|") + [""] * 5)[:5]
+    if not phase or phase in ("Running", "Pending"):
+        return None
+    parts = [part for part in (reason, ended, message) if part]
+    if code:
+        parts.append(f"exit {code}")
+    return f"{phase}: {', '.join(parts)}" if parts else phase
+
+
 def log_pod_usage(
-    settings: KubeSettings, *, pod: str, role: str, usage: Optional[dict], seconds: float
+    settings: KubeSettings,
+    *,
+    pod: str,
+    role: str,
+    usage: Optional[dict],
+    seconds: float,
+    ended: Optional[str] = None,
 ) -> None:
-    if not settings.usage_log or usage is None:
+    """One line for a pod that ends: its counters, or the reason it was not running."""
+    if usage and usage.get("oom_kills"):
+        logger.warning(
+            f"Pod {pod} ({role}): {usage['oom_kills']} process(es) killed for memory, "
+            "at the pod's limit"
+        )
+    if ended:
+        logger.warning(f"Pod {pod} ({role}) was not running when it was removed: {ended}")
+    if usage is None and ended is None:
         return
     line = json.dumps(
-        {"pod": pod, "role": role, "lifetime_seconds": round(seconds, 1), **usage}
+        {
+            "pod": pod,
+            "role": role,
+            "lifetime_seconds": round(seconds, 1),
+            **(usage or {}),
+            **({"ended": ended} if ended else {}),
+        }
     )
+    paths = [settings.usage_log]
+    if settings.log_dir:
+        paths.append(os.path.join(settings.log_dir, "pods.jsonl"))
+    for path in paths:
+        if not path:
+            continue
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            logger.warning(f"Could not write the pod usage log: {exc}")
+
+
+def pod_ending(settings: KubeSettings, pod: str) -> tuple[Optional[dict], Optional[str]]:
+    """What is read of a pod before it is removed: its counters, else why it stopped."""
+    usage = read_pod_usage(settings, pod)
+    return usage, (None if usage is not None else pod_end_reason(settings, pod))
+
+
+def keep_pod_log(settings: KubeSettings, pod: str) -> None:
+    """The pod's log, kept in the log folder: it goes with the pod otherwise."""
+    if not settings.log_dir:
+        return
     try:
-        with open(settings.usage_log, "a") as handle:
-            handle.write(line + "\n")
-    except OSError as exc:
-        logger.warning(f"Could not write the pod usage log: {exc}")
+        logs = kube(settings, ["logs", f"pod/{pod}"], timeout=60)
+        if logs.returncode != 0:
+            return
+        os.makedirs(settings.log_dir, exist_ok=True)
+        with open(os.path.join(settings.log_dir, f"{pod}.log"), "w") as handle:
+            handle.write(logs.stdout)
+    except (RuntimeError, OSError) as exc:
+        logger.warning(f"The log of pod {pod} was not kept: {exc}")
 
 
 def delete_resources(settings: KubeSettings, resources: list[str]) -> None:
@@ -719,7 +939,9 @@ def _ensure_scoring_policy(settings: KubeSettings) -> None:
     with _scoring_policy_lock:
         if key in _scoring_policy_applied:
             return
-        _create(settings, scoring_policy_manifest(), apply=True)
+        # Every build's scoring pods stand behind this one rule, so it is no build's:
+        # removed with one build, it would open the others'.
+        _create(settings, scoring_policy_manifest(), apply=True, shared=True)
         _scoring_policy_applied.add(key)
 
 
@@ -735,13 +957,15 @@ class CandidatePod:
         return self.settings.exec_argv(self.name, command, stdin=True)
 
     def delete(self) -> None:
-        if self.settings.usage_log:
+        if self.settings.usage_log or self.settings.log_dir:
+            usage, ended = pod_ending(self.settings, self.name)
             log_pod_usage(
                 self.settings,
                 pod=self.name,
                 role=ROLE_SCORING,
-                usage=read_pod_usage(self.settings, self.name),
+                usage=usage,
                 seconds=time.monotonic() - self.started_at,
+                ended=ended,
             )
         delete_resources(self.settings, [f"pod/{self.name}"])
 
@@ -1136,6 +1360,8 @@ class KubeSandboxRuntime(NativeSandboxRuntime):
     def _remove_gateway(self, *, force: bool = False) -> None:
         if not force and not self._gateway_started:
             return
+        if self._gateway_started:
+            keep_pod_log(self.settings, self.gateway_container_name)
         delete_resources(
             self.settings,
             [f"pod/{self.gateway_container_name}", f"secret/{self.gateway_container_name}"],
@@ -1170,12 +1396,17 @@ class KubeSandboxRuntime(NativeSandboxRuntime):
                 ):
                     if role == ROLE_GATEWAY and not self._gateway_started:
                         continue
-                    usage = read_pod_usage(self.settings, pod)
+                    usage, ended = pod_ending(self.settings, pod)
                     if usage is not None:
                         self._usage[role] = usage
-                        log_pod_usage(
-                            self.settings, pod=pod, role=role, usage=usage, seconds=lifetime
-                        )
+                    log_pod_usage(
+                        self.settings,
+                        pod=pod,
+                        role=role,
+                        usage=usage,
+                        seconds=lifetime,
+                        ended=ended,
+                    )
             self._remove_gateway(force=force)
             if force or self._started or self._network_started:
                 delete_resources(

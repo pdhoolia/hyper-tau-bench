@@ -2,6 +2,7 @@
 
 import io
 import json
+import signal
 import sys
 import tarfile
 import threading
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from tau2.hyper.runtime_contract import CONSTRUCTION_RUNTIME_CONTRACT_VERSION
-from tau2.hyper.sandbox import kube_runtime
+from tau2.hyper.sandbox import kube_runtime, kube_tools
 from tau2.hyper.sandbox.kube_runtime import (
     KUBE_BACKEND,
     LABEL_BUILD,
@@ -545,3 +546,391 @@ def test_callback_relay_carries_a_request_out_and_its_response_back(tmp_path):
         assert relay._answers.keys() == {"abc123"}
     finally:
         relay.stop()
+
+
+# --- a build started from outside: marked, found, removed ------------------------
+
+MARKED = KubeSettings(
+    cli="oc",
+    namespace="strata",
+    image=IMAGE,
+    labels=(("strata.runner", "openshift"), ("strata.build", "41-1")),
+    owner_pod="strata-runner-7c9d",
+    owner_uid="0b1f-uid",
+    pull_secrets=("icr-image-pull",),
+    resources={
+        "scoring": {
+            "requests": {"cpu": "50m", "memory": "128Mi"},
+            "limits": {"cpu": "500m", "memory": "512Mi"},
+        },
+        "sandbox": {"limits": {}},
+    },
+)
+OWNER = [{"apiVersion": "v1", "kind": "Pod", "name": "strata-runner-7c9d", "uid": "0b1f-uid"}]
+
+
+def test_settings_read_who_started_the_build(monkeypatch):
+    monkeypatch.setenv("TAU2_KUBE_LABELS", "strata.runner=openshift, strata.build=41-1")
+    monkeypatch.setenv("TAU2_KUBE_OWNER_POD", "strata-runner-7c9d")
+    monkeypatch.setenv("TAU2_KUBE_OWNER_UID", "0b1f-uid")
+    monkeypatch.setenv("TAU2_KUBE_PULL_SECRETS", "icr-image-pull, other")
+    monkeypatch.setenv("TAU2_KUBE_RESOURCES", json.dumps(MARKED.resources))
+    monkeypatch.setenv("TAU2_KUBE_LOG_DIR", "/runs/pods")
+    settings = KubeSettings.from_environment()
+    assert settings.labels == MARKED.labels
+    assert (settings.owner_pod, settings.owner_uid) == ("strata-runner-7c9d", "0b1f-uid")
+    assert settings.pull_secrets == ("icr-image-pull", "other")
+    assert settings.resources == MARKED.resources
+    assert settings.log_dir == "/runs/pods"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("TAU2_KUBE_LABELS", "no-equals-sign"),
+        ("TAU2_KUBE_LABELS", "key=not a label value"),
+        # This path's own labels are not the caller's to set.
+        ("TAU2_KUBE_LABELS", "tau2.hyper/role=scoring"),
+        ("TAU2_KUBE_RESOURCES", "not json"),
+        ("TAU2_KUBE_RESOURCES", '{"database": {}}'),
+        ("TAU2_KUBE_RESOURCES", '{"scoring": {"cpu": "1"}}'),
+        # Half an owner is none.
+        ("TAU2_KUBE_OWNER_POD", "strata-runner-7c9d"),
+    ],
+)
+def test_settings_refuse_what_the_cluster_would(monkeypatch, name, value):
+    for other in ("TAU2_KUBE_LABELS", "TAU2_KUBE_RESOURCES", "TAU2_KUBE_OWNER_POD", "TAU2_KUBE_OWNER_UID"):
+        monkeypatch.delenv(other, raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name.rsplit("_", 1)[0]):
+        KubeSettings.from_environment()
+
+
+def test_a_pod_is_marked_and_keeps_its_own_labels():
+    plain = scoring_pod_manifest(name="tau2-candidate-abc", image=IMAGE, memory="4g", cpus="2")
+    marked = kube_runtime.stamped(MARKED, plain)
+    # The manifest the functions return is not changed: the mark is a copy.
+    assert plain["metadata"]["labels"] == {LABEL_ROLE: "scoring"}
+    assert marked["metadata"]["labels"] == {
+        "strata.runner": "openshift",
+        "strata.build": "41-1",
+        LABEL_ROLE: "scoring",
+    }
+    assert marked["metadata"]["ownerReferences"] == OWNER
+    assert marked["spec"]["imagePullSecrets"] == [{"name": "icr-image-pull"}]
+    # The settings' numbers stand in for the measured requests and the task's ceilings.
+    assert marked["spec"]["containers"][0]["resources"] == MARKED.resources["scoring"]
+    _assert_restricted(marked)
+
+    # An empty object takes the limits away; the requests it does not name stay.
+    sandbox = kube_runtime.stamped(
+        MARKED,
+        sandbox_pod_manifest(name="b", image=IMAGE, env={}, gateway_ip="10.0.0.1", memory="4g", cpus="2"),
+    )
+    assert sandbox["spec"]["containers"][0]["resources"] == {
+        "requests": {"cpu": "250m", "memory": "768Mi"}
+    }
+    # A kind the settings do not name keeps what the manifest has.
+    gateway = kube_runtime.stamped(
+        MARKED, gateway_pod_manifest(name="b-model-gateway", build="b", image=IMAGE, secret_name="s")
+    )
+    assert gateway["spec"]["containers"][0]["resources"] == {
+        "requests": {"cpu": "50m", "memory": "64Mi"}
+    }
+
+    # What is not a pod gets the labels and the owner, and nothing of a pod's.
+    service = kube_runtime.stamped(MARKED, gateway_service_manifest(name="b-model-gateway", build="b"))
+    assert service["metadata"]["labels"]["strata.build"] == "41-1"
+    assert service["metadata"]["ownerReferences"] == OWNER
+    assert "imagePullSecrets" not in service["spec"]
+
+    # No settings, no mark: the manifests are what they were.
+    assert kube_runtime.stamped(KubeSettings(), plain) == plain
+
+
+def test_everything_a_build_makes_is_marked_but_the_shared_rule(cluster, monkeypatch, tmp_path):
+    kit = tmp_path / "kit"
+    (kit / "workspace").mkdir(parents=True)
+    runtime = KubeSandboxRuntime(kit, settings=MARKED)
+    runtime.start()
+    runtime.start_model_gateway(
+        ModelGatewaySpec(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            token="scoped-token",
+            upstream_api_key="raw-provider-key",
+            expires_at=9999999999,
+        )
+    )
+    kube_runtime.start_candidate_pod(image=IMAGE, kit_path=kit, settings=MARKED)
+
+    kinds = [manifest["kind"] for manifest in cluster.created]
+    assert kinds == [
+        "NetworkPolicy", "NetworkPolicy", "Service", "Pod", "Secret", "Pod", "NetworkPolicy", "Pod",
+    ]
+    shared = cluster.created[-2]
+    assert shared["metadata"]["name"] == "tau2-hyper-scoring"
+    # Every build's scoring pods stand behind it, so no build owns it.
+    assert "labels" not in shared["metadata"] and "ownerReferences" not in shared["metadata"]
+    for manifest in cluster.created[:-2] + cluster.created[-1:]:
+        assert manifest["metadata"]["labels"]["strata.build"] == "41-1", manifest["kind"]
+        assert manifest["metadata"]["ownerReferences"] == OWNER, manifest["kind"]
+        if manifest["kind"] == "Pod":
+            assert manifest["spec"]["imagePullSecrets"] == [{"name": "icr-image-pull"}]
+
+
+def test_a_pod_the_quota_refuses_waits_for_room(monkeypatch):
+    answers = [
+        SimpleNamespace(returncode=1, stdout="", stderr='pods "p" is forbidden: exceeded quota: compute, requested: pods=1, used: pods=20, limited: pods=20'),
+        SimpleNamespace(returncode=1, stdout="", stderr='pods "p" is forbidden: exceeded quota: compute'),
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+    ]
+    calls, naps = [], []
+    monkeypatch.setattr(kube_runtime, "kube", lambda settings, args, **kw: (calls.append(args), answers.pop(0))[1])
+    monkeypatch.setattr(kube_runtime.time, "sleep", naps.append)
+    manifest = scoring_pod_manifest(name="p", image=IMAGE)
+
+    kube_runtime._create(KubeSettings(), manifest)
+    assert len(calls) == 3 and naps == [5.0, 5.0]
+
+    # Any other refusal is passed on at once.
+    answers[:] = [SimpleNamespace(returncode=1, stdout="", stderr="forbidden: unable to validate against any security context constraint")]
+    with pytest.raises(RuntimeError, match="Failed to create Pod p: forbidden"):
+        kube_runtime._create(KubeSettings(), manifest)
+
+    # And the wait has an end: the time a pod gets to become ready.
+    answers[:] = [SimpleNamespace(returncode=1, stdout="", stderr="exceeded quota: compute")] * 3
+    clock = iter([0.0, 400.0])
+    monkeypatch.setattr(kube_runtime.time, "monotonic", lambda: next(clock))
+    with pytest.raises(RuntimeError, match="exceeded quota"):
+        kube_runtime._create(KubeSettings(ready_timeout_seconds=300), manifest)
+
+
+def test_what_goes_with_a_pod_is_kept(monkeypatch, tmp_path):
+    settings = KubeSettings(log_dir=str(tmp_path / "pods"))
+    said = {
+        "memory.peak": "536870912\nusage_usec 4000000\nuser_usec 1\nlow 0\nhigh 0\nmax 3\noom 3\noom_kill 2\n",
+        "logs": "gateway: 200 POST /v1/messages\n",
+    }
+
+    def fake(settings, args, *, input=None, timeout=60):
+        if args[0] == "exec" and "memory.peak" in " ".join(args):
+            return SimpleNamespace(returncode=0, stdout=said["memory.peak"], stderr="")
+        if args[0] == "logs":
+            return SimpleNamespace(returncode=0, stdout=said["logs"], stderr="")
+        if args[0] == "get":
+            return SimpleNamespace(returncode=0, stdout="Failed|Evicted|The node was low on resource: memory.||", stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="pod is not running")
+
+    monkeypatch.setattr(kube_runtime, "kube", fake)
+
+    # A process killed at the pod's memory limit leaves the pod running: its counters say so.
+    usage, ended = kube_runtime.pod_ending(settings, "tau2-candidate-abc")
+    assert usage == {"memory_peak_bytes": 536870912, "cpu_seconds": 4.0, "oom_kills": 2}
+    assert ended is None
+    kube_runtime.log_pod_usage(settings, pod="tau2-candidate-abc", role="scoring", usage=usage, seconds=12.34)
+
+    # A pod that is no longer running has no counters to read: the cluster's reason is kept.
+    said["memory.peak"] = ""
+    monkeypatch.setattr(kube_runtime, "read_pod_usage", lambda settings, pod: None)
+    usage, ended = kube_runtime.pod_ending(settings, "tau2-candidate-def")
+    assert usage is None
+    assert ended == "Failed: Evicted, The node was low on resource: memory."
+    kube_runtime.log_pod_usage(settings, pod="tau2-candidate-def", role="scoring", usage=usage, seconds=3, ended=ended)
+
+    lines = [json.loads(line) for line in (tmp_path / "pods" / "pods.jsonl").read_text().splitlines()]
+    assert lines == [
+        {"pod": "tau2-candidate-abc", "role": "scoring", "lifetime_seconds": 12.3, "memory_peak_bytes": 536870912, "cpu_seconds": 4.0, "oom_kills": 2},
+        {"pod": "tau2-candidate-def", "role": "scoring", "lifetime_seconds": 3, "ended": "Failed: Evicted, The node was low on resource: memory."},
+    ]
+
+    # The model gateway's log goes with its pod, so it is read first.
+    kube_runtime.keep_pod_log(settings, "tau2-claude-code-abc-model-gateway")
+    assert (tmp_path / "pods" / "tau2-claude-code-abc-model-gateway.log").read_text() == said["logs"]
+    # No folder named, nothing kept and nothing asked of the cluster.
+    monkeypatch.setattr(kube_runtime, "kube", lambda *a, **k: pytest.fail("the cluster was asked"))
+    kube_runtime.keep_pod_log(KubeSettings(), "pod")
+
+
+def test_sigterm_ends_a_run_as_an_interrupt_does():
+    from tau2.cli import _end_on_sigterm
+
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        _end_on_sigterm()
+        assert signal.getsignal(signal.SIGTERM) is signal.default_int_handler
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+# --- the two commands for whoever starts builds from outside ---------------------
+
+
+class _ProbedCluster(_FakeCluster):
+    """A cluster whose pods answer the probe's two scripts."""
+
+    def __init__(self, *, enforces: bool, control_reaches: bool = True):
+        super().__init__()
+        self.enforces = enforces
+        self.control_reaches = control_reaches
+
+    def kube(self, settings, args, *, input=None, timeout=60):
+        if args[0] == "exec" and kube_tools._CONNECT in args:
+            self.calls.append(list(args))
+            pod, targets = args[1], args[args.index(kube_tools._CONNECT) + 1 :]
+            control = pod.endswith("-control")
+            rules = any(m["kind"] == "NetworkPolicy" for m in self.created)
+            reached = self.control_reaches if control else not (self.enforces and rules)
+            entries = [
+                {"target": t, "address": "10.217.5.9" if control else t.rpartition(":")[0], "port": int(t.rpartition(":")[2]), "reached": reached}
+                for t in targets
+            ]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(entries) + "\n", stderr="")
+        if args[0] == "exec" and kube_tools._STARTS in args:
+            self.calls.append(list(args))
+            asked = args[args.index(kube_tools._STARTS) + 1 :]
+            harnesses = {
+                item.split("=")[0]: (
+                    {"started": False, "detail": "the image has no `bob` command"}
+                    if item.startswith("bob=")
+                    else {"started": True, "version": "1.2.3"}
+                )
+                for item in asked
+            }
+            starts = {"uid": 1000650000, "gid": 0, "home": "/runtime-home", "home_writable": True, "harnesses": harnesses}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(starts) + "\n", stderr="")
+        return super().kube(settings, args, input=input, timeout=timeout)
+
+
+def _probe(monkeypatch, fake, **kwargs):
+    monkeypatch.setattr(kube_runtime, "kube", fake.kube)
+    return kube_tools.probe(
+        MARKED,
+        image=IMAGE,
+        targets=["gateway.strata.svc:8080"],
+        harnesses=["claude-code", "codex", "bob"],
+        **kwargs,
+    )
+
+
+def test_probe_says_the_sandbox_is_isolated_where_the_rule_is_enforced(monkeypatch):
+    fake = _ProbedCluster(enforces=True)
+    result = _probe(monkeypatch, fake)
+
+    # The build's own rules, then its Service, then the sandbox and the control beside it.
+    assert [m["kind"] for m in fake.created] == ["NetworkPolicy", "NetworkPolicy", "Service", "Pod", "Pod"]
+    sandbox, control = fake.created[-2:]
+    assert sandbox["metadata"]["labels"][LABEL_ROLE] == "sandbox"
+    assert control["metadata"]["labels"][LABEL_ROLE] == "probe-control"
+    # The rules select the sandbox and never the control.
+    for policy in fake.created[:2]:
+        assert policy["spec"]["podSelector"]["matchLabels"][LABEL_ROLE] != "probe-control"
+    # The probe's pods are marked as a build's are, so a sweep finds one that was left.
+    for manifest in fake.created:
+        assert manifest["metadata"]["labels"]["strata.runner"] == "openshift"
+    _assert_restricted(control)
+
+    assert result["isolated"] is True
+    assert result["rules"] is True
+    assert result["security_context_constraint"] == "restricted-v2"
+    assert result["uid"] == 1000650000 and result["home_writable"] is True
+    assert result["control"][0]["reached"] is True
+    # The sandbox was given the number the control resolved, and its entry carries the name.
+    connects = [call for call in fake.calls if kube_tools._CONNECT in call]
+    assert connects[1][-1] == "10.217.5.9:8080"
+    assert result["sandbox"] == [
+        {"target": "gateway.strata.svc:8080", "address": "10.217.5.9", "port": 8080, "reached": False}
+    ]
+    assert result["harnesses"]["codex"] == {"started": True, "version": "1.2.3"}
+    assert result["harnesses"]["bob"]["started"] is False
+
+    # Everything it made is removed, the pods first.
+    deletes = [call for call in fake.calls if call[0] == "delete"]
+    assert [name.split("/")[0] for name in deletes[0][1:3]] == ["pod", "pod"]
+    removed = {name for call in deletes for name in call[1:] if "/" in name}
+    assert len(removed) == 5
+
+
+def test_probe_says_no_where_the_rule_is_not_enforced(monkeypatch):
+    result = _probe(monkeypatch, _ProbedCluster(enforces=False))
+    assert result["isolated"] is False
+    assert "does not enforce" in result["detail"]
+
+    # The same answer on a cluster that enforces, with the rules left out.
+    fake = _ProbedCluster(enforces=True)
+    result = _probe(monkeypatch, fake, rules=False)
+    assert [m["kind"] for m in fake.created] == ["Service", "Pod", "Pod"]
+    assert result["isolated"] is False and result["rules"] is False
+
+
+def test_probe_does_not_guess_when_nothing_answers_the_control(monkeypatch):
+    fake = _ProbedCluster(enforces=True, control_reaches=False)
+    result = _probe(monkeypatch, fake)
+    assert result["isolated"] is None
+    assert "could not be tested" in result["detail"]
+    # Nothing to try from the sandbox, so it was not asked.
+    assert len([call for call in fake.calls if kube_tools._CONNECT in call]) == 1
+
+
+def test_probe_removes_what_it_made_when_it_fails(monkeypatch):
+    fake = _ProbedCluster(enforces=True)
+    monkeypatch.setattr(kube_runtime, "kube", fake.kube)
+    monkeypatch.setattr(kube_tools, "_wait_ready", lambda settings, pod: (_ for _ in ()).throw(RuntimeError("Pod did not become ready")))
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        kube_tools.probe(MARKED, image=IMAGE, targets=["a:1"], harnesses=[])
+    removed = {name for call in fake.calls if call[0] == "delete" for name in call[1:] if "/" in name}
+    assert len(removed) == 5
+
+
+def test_sweep_removes_a_builds_leftovers_and_names_its_secret(monkeypatch):
+    items = [
+        {"kind": "Pod", "metadata": {"name": "tau2-claude-code-abc", "labels": {LABEL_BUILD: "tau2-claude-code-abc"}}},
+        {"kind": "Pod", "metadata": {"name": "tau2-candidate-123", "labels": {LABEL_ROLE: "scoring"}}},
+        {"kind": "Service", "metadata": {"name": "tau2-claude-code-abc-model-gateway", "labels": {LABEL_BUILD: "tau2-claude-code-abc"}}},
+        {"kind": "NetworkPolicy", "metadata": {"name": "tau2-claude-code-abc-sandbox", "labels": {LABEL_BUILD: "tau2-claude-code-abc"}}},
+    ]
+    calls = []
+
+    def fake(settings, args, *, input=None, timeout=60):
+        calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"items": items}) if args[0] == "get" else "", stderr="")
+
+    monkeypatch.setattr(kube_runtime, "kube", fake)
+    removed = kube_tools.sweep(KubeSettings(cli="oc", namespace="strata"), "strata.build=41-1")
+
+    # Secrets are never listed: a right to list them is a right to read them all.
+    assert calls[0][:2] == ["get", "pod,service,networkpolicy"]
+    assert calls[0][2:4] == ["-l", "strata.build=41-1"]
+    assert removed == [
+        "pod/tau2-claude-code-abc",
+        "pod/tau2-candidate-123",
+        "secret/tau2-claude-code-abc-model-gateway",
+        "service/tau2-claude-code-abc-model-gateway",
+        "networkpolicy/tau2-claude-code-abc-sandbox",
+    ]
+    # The pods go first: a sandbox never stands without its rule.
+    deletes = [call for call in calls if call[0] == "delete"]
+    assert deletes[0][1:3] == ["pod/tau2-claude-code-abc", "pod/tau2-candidate-123"]
+    assert "--ignore-not-found" in deletes[1]
+
+    # A selector that selects everything is refused.
+    for selector in ("", "strata.build"):
+        with pytest.raises(ValueError, match="selector"):
+            kube_tools.sweep(KubeSettings(), selector)
+
+
+def test_the_commands_print_one_json_object(monkeypatch, capsys):
+    monkeypatch.setenv("TAU2_KUBE_IMAGE", IMAGE)
+    for name in ("TAU2_KUBE_LABELS", "TAU2_KUBE_OWNER_POD", "TAU2_KUBE_OWNER_UID", "TAU2_KUBE_RESOURCES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(kube_runtime, "kube", _ProbedCluster(enforces=True).kube)
+    assert kube_tools.main(["probe", "--target", "gateway:8080", "--harness", "codex"]) == 0
+    assert json.loads(capsys.readouterr().out)["isolated"] is True
+
+    with pytest.raises(SystemExit):
+        kube_tools.main(["probe", "--target", "no-port"])
+    capsys.readouterr()
+
+    monkeypatch.setattr(kube_runtime, "kube", lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="forbidden"))
+    assert kube_tools.main(["sweep", "--selector", "strata.runner=openshift"]) == 1
+    assert "Could not list" in json.loads(capsys.readouterr().out)["error"]
